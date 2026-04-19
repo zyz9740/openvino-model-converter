@@ -46,19 +46,41 @@ Getting the complete model source code is critical -- many models have custom op
 
 ## 2. Model Conversion
 
-The conversion pipeline typically goes: source model -> ONNX -> (optional) ONNX simplification -> OpenVINO IR. Each model has its own quirks, so refer to `scripts/example_convert.py` as a starting template and adapt it to the specific model.
+There are two main paths to get an OpenVINO IR model. Which one to use depends on the model framework and what the model repo provides. Refer to `scripts/example_convert.py` as a starting template and adapt it to the specific model.
 
-### Conversion steps
+### Path A: Direct export to OpenVINO IR (preferred when available)
+
+Some frameworks and models support direct conversion to OpenVINO IR without the ONNX intermediate step. This is simpler and avoids potential ONNX compatibility issues.
+
+- **OpenVINO `ovc` (Model Converter)** can directly convert PyTorch (`torch.nn.Module`), TensorFlow (SavedModel, `.pb`), PaddlePaddle, and TensorFlow Lite models
+- Some model repos provide their own OpenVINO export scripts -- check for these first
+- Use `openvino.convert_model()` in Python to convert directly from a PyTorch model object or TensorFlow SavedModel path
+
+### Path B: Via ONNX intermediate format
+
+When direct conversion isn't available or fails, go through ONNX:
 
 1. **Export to ONNX** -- use the model's own export script if available in the cloned repo, otherwise write a custom export script based on the model architecture. Set appropriate input shapes and opset version.
 2. **Simplify ONNX** (recommended) -- run `onnxsim` to fold constants and remove redundant ops. This often fixes compatibility issues with OpenVINO and improves inference speed.
-3. **Convert to OpenVINO IR** -- use OpenVINO's model optimizer (`mo` or `ovc`) to produce `.xml` + `.bin` files. Default to FP16 precision for a good balance of size and accuracy.
+3. **Convert to OpenVINO IR** -- use `mo` or `ovc` to produce `.xml` + `.bin` files.
+
+### Decision guide
+
+| Situation | Recommended path |
+|-----------|------------------|
+| PyTorch model with standard ops | Try Path A first (`ovc` / `openvino.convert_model`), fall back to Path B |
+| TensorFlow SavedModel | Path A (`ovc` handles it directly) |
+| Model repo provides ONNX export script | Path B (author-tested export is reliable) |
+| Model repo provides `.onnx` file | Path B (skip export, go straight to simplify + convert) |
+| Custom/exotic operators | Path B with careful opset selection, or Path A with `ov_extension` |
+
+Always default to FP16 precision for a good balance of model size and accuracy.
 
 ### Key considerations
 
-- Check the model repo for existing ONNX export examples or scripts -- reuse them rather than writing from scratch, because model authors know their own edge cases best
+- Check the model repo for existing export examples or scripts (ONNX or OpenVINO) -- reuse them rather than writing from scratch, because model authors know their own edge cases best
 - Handle dynamic shapes carefully -- some models need explicit static shape setting for OpenVINO compatibility
-- If conversion fails, try alternative approaches (different opset versions, shape overrides, operator workarounds) before giving up. Document every attempt in the failure report.
+- If one path fails, try the other before giving up. Document every attempt in the failure report.
 
 ## 3. Performance Benchmarking
 
@@ -161,3 +183,42 @@ Keep the file listing in README synchronized with actual directory contents.
 
 - **Encoding (Windows)**: Stick to ASCII-printable characters in all output. GBK encoding on Windows will choke on emoji and many Unicode symbols, causing script failures
 - **Paths**: Use absolute paths for all file I/O and tool calls. Relative paths break easily when working directory changes between steps
+
+---
+
+## Completion Checklist
+
+Before delivering results to the user, verify every item. This catches common omissions that break reproducibility.
+
+### Files
+
+- [ ] `export_<model_name>/` directory exists with correct structure
+- [ ] `<model_name>/` contains the cloned model source code
+- [ ] `converter/convert.py` exists and is runnable end-to-end
+- [ ] `converter/<model_name>_simplified.xml` and `.bin` exist and are non-empty
+- [ ] `benchmark/benchmark_cpu_result.txt` exists with real `benchmark_app` output
+- [ ] `benchmark/benchmark_gpu_result.txt` exists with real `benchmark_app` output
+- [ ] `benchmark/benchmark_app_usage.md` exists with commands and parameter explanations
+- [ ] `demo/infer_demo.py` exists and runs successfully
+- [ ] `demo/` contains sample input data (real image/data or generated tensors)
+- [ ] `demo/` contains pre-generated sample output for user comparison
+- [ ] `README.md` exists at `export_<model_name>/` root
+
+### README content
+
+- [ ] Environment and dependency installation instructions
+- [ ] Complete from-scratch conversion steps referencing `converter/convert.py`
+- [ ] Benchmark commands and how to interpret results
+- [ ] Demo usage with custom data replacement instructions
+- [ ] File listing matches actual directory contents
+
+### Data integrity
+
+- [ ] All performance numbers in README trace back to `benchmark_app` log files
+- [ ] Provenance documented: model source URL + commit, weight source + size, test data source
+- [ ] No hardcoded absolute paths in `convert.py`, `infer_demo.py`, or `README.md` (use relative paths within the export directory for portability)
+
+### Conversion report
+
+- [ ] Success: detailed step-by-step report with commands and outputs
+- [ ] Failure: `<model>_OpenVINO_conversion_failure_analysis.md` with all attempts, errors, and root cause
