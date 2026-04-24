@@ -3,15 +3,16 @@ name: openvino-converter
 description: >
   Convert mainstream AI models (PyTorch, TensorFlow, ONNX, YOLO series, point cloud models, etc.)
   to Intel OpenVINO IR format, with automated model repo cloning, weight downloading, format
-  conversion, performance benchmarking, and inference verification. Use this skill whenever the user
-  mentions model conversion to OpenVINO, deploying models on Intel CPU/GPU, IR format export, model
-  optimization for Intel hardware, or converting any deep learning model for Intel inference -- even
-  if they don't explicitly say "OpenVINO".
+  conversion, performance benchmarking, numerical validation, and inference verification. Includes
+  mandatory cross-platform validation to ensure OpenVINO IR (GPU) outputs match original framework
+  (CPU) outputs. Use this skill whenever the user mentions model conversion to OpenVINO, deploying
+  models on Intel CPU/GPU, IR format export, model optimization for Intel hardware, or converting
+  any deep learning model for Intel inference -- even if they don't explicitly say "OpenVINO".
 ---
 
 # OpenVINO Model Converter
 
-Convert AI models to OpenVINO IR format with full source code acquisition, weight download, conversion, benchmarking, and verification -- all outputs 100% reproducible.
+Convert AI models to OpenVINO IR format with full source code acquisition, weight download, conversion, benchmarking, numerical validation, and inference verification -- all outputs 100% reproducible.
 
 ## Workflow Overview
 
@@ -20,11 +21,12 @@ Follow this sequence for every conversion, whether it succeeds or fails:
 1. **Acquire model & weights** -- clone source repo and download pretrained weights
 2. **Convert model** -- export to ONNX, optimize, convert to OpenVINO IR
 3. **Benchmark** -- run `benchmark_app` on CPU and GPU
-4. **Verify** -- write and run an inference demo with real data, show results to user
-5. **Document** -- write conversion report and README
-6. **Deliver** -- organize all files into the standard export directory
+4. **Validate** -- verify OpenVINO IR (GPU) outputs match original framework (CPU) outputs
+5. **Verify** -- write and run an inference demo with real data, show results to user
+6. **Document** -- write conversion report and README
+7. **Deliver** -- organize all files into the standard export directory
 
-If conversion fails, still complete steps 5-6 (failure report + root cause analysis).
+If conversion fails, still complete steps 6-7 (failure report + root cause analysis).
 
 ---
 
@@ -94,7 +96,7 @@ Use OpenVINO's official `benchmark_app` tool exclusively. Custom Python timing s
 - Use `scripts/parse_benchmark.py` to extract key metrics (latency, throughput, device info) from raw logs for structured summaries
 - When reporting performance numbers in README or to the user, always cite the exact log file path. Every number must trace back to `benchmark_app` output -- never approximate or editorialize performance data, because users rely on these numbers for hardware purchasing and deployment decisions
 
-## 4. Inference Verification
+## 4. Inference Verification & Validation
 
 A converted model is only useful if someone can actually run it. The demo serves as both a correctness check and a quickstart for the user.
 
@@ -113,6 +115,24 @@ The choice of test data matters -- random noise through a real model produces me
 - Write an `infer_demo.py` that works out of the box with the included test data
 - Show inference results to the user via `view_image`/`view_video` tools -- seeing actual output builds confidence the conversion is correct
 - Support custom data replacement with clear instructions, so the user can swap in their own inputs
+
+### Numerical Validation (Required)
+
+To ensure the OpenVINO IR model preserves the original model's accuracy, perform a cross-platform numerical validation:
+
+- **Goal**: Verify that OpenVINO IR inference on GPU produces numerically consistent results with the original framework (PyTorch, TensorFlow, etc.) inference on CPU
+- **Method**: Run identical input data through both pipelines and compare output tensors
+- **Acceptance criteria**: 
+  - For FP16 models: outputs should match within reasonable floating-point tolerance (e.g., mean absolute difference < 1e-3, max difference < 1e-2)
+  - For FP32 models: tighter tolerance (e.g., mean absolute difference < 1e-5)
+- **All validation artifacts go in `validation/` directory**:
+  - `validate.py` -- automated comparison script
+  - `validation_report.md` -- results, metrics (mean/max/percentile errors), pass/fail status
+  - `source_output.npy` -- ground truth outputs from original framework on CPU
+  - `openvino_output.npy` -- OpenVINO IR outputs on GPU
+  - `diff_visualization.png` (optional) -- heatmap or distribution plot of errors
+
+This validation is mandatory because deployment on Intel GPUs requires confidence that the converted model maintains accuracy relative to the original research/training code.
 
 ## 5. Provenance & Conversion Report
 
@@ -149,6 +169,12 @@ export_<model_name>/
     benchmark_cpu_result.txt       # Raw benchmark_app CPU log
     benchmark_gpu_result.txt       # Raw benchmark_app GPU log
     benchmark_app_usage.md         # benchmark_app usage guide
+  validation/                      # Numerical accuracy validation
+    validate.py                    # Automated cross-platform comparison script
+    validation_report.md           # Validation results and metrics
+    source_output.npy              # Ground truth from original framework (CPU)
+    openvino_output.npy            # OpenVINO IR outputs (GPU)
+    diff_visualization.png         # Error distribution visualization (optional)
   demo/                            # Inference demo and test data
     infer_demo.py                  # Ready-to-run inference demo
     <sample input files>           # Test image/data used by the demo
@@ -162,7 +188,8 @@ Include a complete "reproduce from scratch" section:
 1. Environment and dependency installation
 2. Full ONNX export and conversion steps (pointing to `converter/convert.py`)
 3. How to run benchmarks and interpret results
-4. How to run the inference demo and use custom data
+4. How to run numerical validation (pointing to `validation/validate.py` and `validation/validation_report.md`)
+5. How to run the inference demo and use custom data
 
 Keep the file listing in README synchronized with actual directory contents.
 
@@ -199,6 +226,9 @@ Before delivering results to the user, verify every item. This catches common om
 - [ ] `benchmark/benchmark_cpu_result.txt` exists with real `benchmark_app` output
 - [ ] `benchmark/benchmark_gpu_result.txt` exists with real `benchmark_app` output
 - [ ] `benchmark/benchmark_app_usage.md` exists with commands and parameter explanations
+- [ ] `validation/validate.py` exists and is runnable
+- [ ] `validation/validation_report.md` exists with pass/fail status and error metrics
+- [ ] `validation/source_output.npy` and `openvino_output.npy` exist
 - [ ] `demo/infer_demo.py` exists and runs successfully
 - [ ] `demo/` contains sample input data (real image/data or generated tensors)
 - [ ] `demo/` contains pre-generated sample output for user comparison
@@ -209,6 +239,7 @@ Before delivering results to the user, verify every item. This catches common om
 - [ ] Environment and dependency installation instructions
 - [ ] Complete from-scratch conversion steps referencing `converter/convert.py`
 - [ ] Benchmark commands and how to interpret results
+- [ ] Validation instructions referencing `validation/validate.py` and results
 - [ ] Demo usage with custom data replacement instructions
 - [ ] File listing matches actual directory contents
 
