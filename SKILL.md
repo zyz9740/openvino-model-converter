@@ -88,11 +88,21 @@ Always default to FP16 precision for a good balance of model size and accuracy.
 
 Use OpenVINO's official `benchmark_app` tool exclusively. Custom Python timing scripts introduce measurement noise (GIL contention, warmup variance, etc.) and produce numbers that can't be compared against published benchmarks. `benchmark_app` is the industry-standard tool that Intel and the community rely on.
 
-- Run at least 100 iterations on both CPU and GPU
+### Required command
+
+Run `benchmark_app` with the exact flags below on both CPU and GPU. The `-hint latency` + `-infer_precision f16` combination matches how the model is exported (FP16) and produces latency numbers that reflect real single-request deployment:
+
+```bash
+benchmark_app -m <model.xml> -d CPU -hint latency -infer_precision f16
+benchmark_app -m <model.xml> -d GPU -hint latency -infer_precision f16
+```
+
+Do not substitute other hints (e.g. `throughput`) or precisions unless the user explicitly requests it -- the FP16 latency hint is the contract this skill delivers against.
+
 - Save raw output logs -- these are the authoritative source of truth:
   - `benchmark_cpu_result.txt` -- full CPU test log
   - `benchmark_gpu_result.txt` -- full GPU test log
-  - `benchmark_app_usage.md` -- commands used, parameter explanations, how to read results
+  - `benchmark_app_usage.md` -- the exact commands used, parameter explanations, how to read results
 - Use `scripts/parse_benchmark.py` to extract key metrics (latency, throughput, device info) from raw logs for structured summaries
 - When reporting performance numbers in README or to the user, always cite the exact log file path. Every number must trace back to `benchmark_app` output -- never approximate or editorialize performance data, because users rely on these numbers for hardware purchasing and deployment decisions
 
@@ -120,16 +130,16 @@ The choice of test data matters -- random noise through a real model produces me
 
 To ensure the OpenVINO IR model preserves the original model's accuracy, perform a cross-platform numerical validation:
 
-- **Goal**: Verify that OpenVINO IR inference on GPU produces numerically consistent results with the original framework (PyTorch, TensorFlow, etc.) inference on CPU
-- **Method**: Run identical input data through both pipelines and compare output tensors
-- **Acceptance criteria**: 
-  - For FP16 models: outputs should match within reasonable floating-point tolerance (e.g., mean absolute difference < 1e-3, max difference < 1e-2)
-  - For FP32 models: tighter tolerance (e.g., mean absolute difference < 1e-5)
+- **Goal**: Verify that OpenVINO IR inference on GPU produces numerically consistent results with the **original PyTorch (or equivalent source framework) inference running on CPU in FP16**. Because the exported IR is FP16, the source-side reference must also run in FP16 -- comparing against FP32 would conflate conversion error with precision-cast error.
+- **Method**: Run identical input data through both pipelines in-process and compare output tensors directly. Do not persist `.npy` files -- the comparison happens live and only the resulting metrics/report are kept.
+- **Do NOT compare OpenVINO CPU vs OpenVINO GPU outputs.** Both sides come from the same IR and the same runtime -- any diff reflects hardware/kernel numerics, not conversion correctness, and the result is not a meaningful signal. The only valid comparison is `source-framework CPU FP16` vs `OpenVINO IR GPU FP16`.
+- **Acceptance criteria** (FP16 vs FP16):
+  - mean absolute difference < 1e-3
+  - max absolute difference < 1e-2
+  - If the model produces classification logits or detection scores, also verify top-k indices match.
 - **All validation artifacts go in `validation/` directory**:
-  - `validate.py` -- automated comparison script
-  - `validation_report.md` -- results, metrics (mean/max/percentile errors), pass/fail status
-  - `source_output.npy` -- ground truth outputs from original framework on CPU
-  - `openvino_output.npy` -- OpenVINO IR outputs on GPU
+  - `validate.py` -- automated comparison script that runs both pipelines in-process and prints/writes metrics (no `.npy` dumps)
+  - `validation_report.md` -- results, metrics (mean/max/percentile errors), pass/fail status, and explicit note of the comparison pair (source-CPU-FP16 vs OV-GPU-FP16)
   - `diff_visualization.png` (optional) -- heatmap or distribution plot of errors
 
 This validation is mandatory because deployment on Intel GPUs requires confidence that the converted model maintains accuracy relative to the original research/training code.
@@ -170,10 +180,8 @@ export_<model_name>/
     benchmark_gpu_result.txt       # Raw benchmark_app GPU log
     benchmark_app_usage.md         # benchmark_app usage guide
   validation/                      # Numerical accuracy validation
-    validate.py                    # Automated cross-platform comparison script
-    validation_report.md           # Validation results and metrics
-    source_output.npy              # Ground truth from original framework (CPU)
-    openvino_output.npy            # OpenVINO IR outputs (GPU)
+    validate.py                    # Automated in-process comparison: source-CPU-FP16 vs OV-GPU-FP16
+    validation_report.md           # Validation results, metrics, and explicit comparison pair
     diff_visualization.png         # Error distribution visualization (optional)
   demo/                            # Inference demo and test data
     infer_demo.py                  # Ready-to-run inference demo
@@ -223,12 +231,13 @@ Before delivering results to the user, verify every item. This catches common om
 - [ ] `<model_name>/` contains the cloned model source code
 - [ ] `converter/convert.py` exists and is runnable end-to-end
 - [ ] `converter/<model_name>_simplified.xml` and `.bin` exist and are non-empty
-- [ ] `benchmark/benchmark_cpu_result.txt` exists with real `benchmark_app` output
-- [ ] `benchmark/benchmark_gpu_result.txt` exists with real `benchmark_app` output
-- [ ] `benchmark/benchmark_app_usage.md` exists with commands and parameter explanations
+- [ ] `benchmark/benchmark_cpu_result.txt` exists, produced by `benchmark_app -m <model> -d CPU -hint latency -infer_precision f16`
+- [ ] `benchmark/benchmark_gpu_result.txt` exists, produced by `benchmark_app -m <model> -d GPU -hint latency -infer_precision f16`
+- [ ] `benchmark/benchmark_app_usage.md` exists with the exact commands above and parameter explanations
 - [ ] `validation/validate.py` exists and is runnable
 - [ ] `validation/validation_report.md` exists with pass/fail status and error metrics
-- [ ] `validation/source_output.npy` and `openvino_output.npy` exist
+- [ ] Validation compares **source-framework CPU FP16** vs **OpenVINO IR GPU FP16** (never OV-CPU vs OV-GPU)
+- [ ] No `.npy` files persisted under `validation/` -- comparison is done in-process
 - [ ] `demo/infer_demo.py` exists and runs successfully
 - [ ] `demo/` contains sample input data (real image/data or generated tensors)
 - [ ] `demo/` contains pre-generated sample output for user comparison
