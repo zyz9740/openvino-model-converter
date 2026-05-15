@@ -48,41 +48,47 @@ Getting the complete model source code is critical -- many models have custom op
 
 ## 2. Model Conversion
 
-There are two main paths to get an OpenVINO IR model. Which one to use depends on the model framework and what the model repo provides. Refer to `scripts/example_convert.py` as a starting template and adapt it to the specific model.
+There are two main paths to get an OpenVINO IR model. The conversion toolchain is never a pure formality -- it can leave a different op graph even for the same model, which in turn changes compile time and sometimes runtime speed. So the policy is: **try the direct path first, and when it works, also run the ONNX path so the user can see the real trade-off on their model**.
 
-### Path A: Direct export to OpenVINO IR (preferred when available)
+### Default order: Path A first, then Path B
 
-Some frameworks and models support direct conversion to OpenVINO IR without the ONNX intermediate step. This is simpler and avoids potential ONNX compatibility issues.
+1. **Always attempt Path A (direct torch/TF -> OpenVINO IR) first.** In practice direct export tends to produce a leaner graph -- fewer `Reshape`/`Unsqueeze` bookkeeping ops, modern fused ops kept whole (e.g. `GroupNormalization`, `ScaledDotProductAttention`) rather than decomposed into ONNX-opset-era primitives. That usually means lower GPU compile time, sometimes lower runtime latency, and a smaller `.xml`. But direct export can also fail on exotic ops or custom control flow, which is why it isn't a hard rule.
+2. **If Path A fails, fall back to Path B (ONNX intermediate).** ONNX has broader op coverage and a more mature fallback-friendly toolchain; many models that won't trace through `ov.convert_model()` directly will still export cleanly to ONNX and convert from there.
+3. **If Path A succeeds, still run Path B as well.** Build both IRs, benchmark both, compare the graphs. The result is what the user actually cares about -- is the direct path really faster for *this* model? Sometimes it is by double digits, sometimes it's a wash, and occasionally Path B wins because ONNX simplification folds constants more aggressively. The only way to know is to measure. See Section 3 for the comparison requirements.
+
+Refer to `scripts/example_convert.py` as a starting template and adapt it to the specific model.
+
+### Path A: Direct export to OpenVINO IR
 
 - **OpenVINO `ovc` (Model Converter)** can directly convert PyTorch (`torch.nn.Module`), TensorFlow (SavedModel, `.pb`), PaddlePaddle, and TensorFlow Lite models
 - Some model repos provide their own OpenVINO export scripts -- check for these first
-- Use `openvino.convert_model()` in Python to convert directly from a PyTorch model object or TensorFlow SavedModel path
+- Use `openvino.convert_model(model, example_input=...)` in Python to convert directly from a PyTorch module or TensorFlow SavedModel path
+- When the torch frontend assigns generic I/O names (like `x.1`, `37`), relabel them on the resulting `ov.Model` via `port.get_tensor().set_names({...})` so the IR contract matches the ONNX-path IR and downstream demo/validation code can stay shared
 
 ### Path B: Via ONNX intermediate format
 
-When direct conversion isn't available or fails, go through ONNX:
-
 1. **Export to ONNX** -- use the model's own export script if available in the cloned repo, otherwise write a custom export script based on the model architecture. Set appropriate input shapes and opset version.
 2. **Simplify ONNX** (recommended) -- run `onnxsim` to fold constants and remove redundant ops. This often fixes compatibility issues with OpenVINO and improves inference speed.
-3. **Convert to OpenVINO IR** -- use `mo` or `ovc` to produce `.xml` + `.bin` files.
+3. **Convert to OpenVINO IR** -- use `ovc` or `openvino.convert_model()` on the `.onnx` file to produce `.xml` + `.bin`.
 
 ### Decision guide
 
-| Situation | Recommended path |
-|-----------|------------------|
-| PyTorch model with standard ops | Try Path A first (`ovc` / `openvino.convert_model`), fall back to Path B |
-| TensorFlow SavedModel | Path A (`ovc` handles it directly) |
-| Model repo provides ONNX export script | Path B (author-tested export is reliable) |
-| Model repo provides `.onnx` file | Path B (skip export, go straight to simplify + convert) |
+| Situation | What to do |
+|-----------|------------|
+| PyTorch module with standard ops | Path A first; if it succeeds, also run Path B and compare |
+| TensorFlow SavedModel | Path A first; if it succeeds, also run Path B and compare |
+| Path A fails (tracing error, unsupported op) | Fall back to Path B; document the failure in the conversion report |
+| Model repo only provides a `.onnx` file, no source | Path B only -- there is no torch module to hand to `ov.convert_model()` |
 | Custom/exotic operators | Path B with careful opset selection, or Path A with `ov_extension` |
 
 Always default to FP16 precision for a good balance of model size and accuracy.
 
 ### Key considerations
 
+- When both paths work, keep both IRs in `converter/` (e.g. `<model>_direct.xml` and `<model>_simplified.xml`) and write ONE shared model-build/patch module that both `convert.py` (ONNX path) and `convert_direct.py` (direct path) import. Duplicating the patching logic across two scripts is a maintenance hazard.
 - Check the model repo for existing export examples or scripts (ONNX or OpenVINO) -- reuse them rather than writing from scratch, because model authors know their own edge cases best
 - Handle dynamic shapes carefully -- some models need explicit static shape setting for OpenVINO compatibility
-- If one path fails, try the other before giving up. Document every attempt in the failure report.
+- If Path A fails, try Path B before giving up. Document every attempt in the failure report.
 
 ## 3. Performance Benchmarking
 
@@ -100,11 +106,27 @@ benchmark_app -m <model.xml> -d GPU -hint latency -infer_precision f16
 Do not substitute other hints (e.g. `throughput`) or precisions unless the user explicitly requests it -- the FP16 latency hint is the contract this skill delivers against.
 
 - Save raw output logs -- these are the authoritative source of truth:
-  - `benchmark_cpu_result.txt` -- full CPU test log
-  - `benchmark_gpu_result.txt` -- full GPU test log
+  - `benchmark_cpu_result.txt` -- full CPU test log for the primary IR (Path A if it succeeded, otherwise Path B)
+  - `benchmark_gpu_result.txt` -- full GPU test log for the primary IR
   - `benchmark_app_usage.md` -- the exact commands used, parameter explanations, how to read results
 - Use `scripts/parse_benchmark.py` to extract key metrics (latency, throughput, device info) from raw logs for structured summaries
 - When reporting performance numbers in README or to the user, always cite the exact log file path. Every number must trace back to `benchmark_app` output -- never approximate or editorialize performance data, because users rely on these numbers for hardware purchasing and deployment decisions
+
+### Path A vs Path B comparison (required when both paths succeed)
+
+Whenever Section 2 yields two IRs -- one from direct export (Path A) and one from the ONNX route (Path B) -- you must benchmark **both** and produce an explicit comparison. This is the whole reason we bothered to build two IRs; a conversion report that only includes one set of numbers is throwing away the most useful information the skill produces.
+
+Additional files to save under `benchmark/`:
+
+- `benchmark_cpu_direct_result.txt`, `benchmark_gpu_direct_result.txt` -- logs for the direct-path IR
+- (The ONNX-path logs live in the standard `benchmark_cpu_result.txt` / `benchmark_gpu_result.txt`, so both sides are preserved.)
+- `comparison_onnx_vs_direct.md` -- written comparison, covering:
+  1. **Latency table (CPU & GPU)** -- median, average, min, throughput, first-inference, compile-time for both IRs, with the percent delta. Pull numbers straight from the raw logs.
+  2. **Op-graph diff** -- load both IRs with `ov.Core().read_model()`, walk `model.get_ops()`, and print a `collections.Counter` of op type names. Put both counters side-by-side in the report and call out specific differences (e.g. "direct path keeps `GroupNormalization`; ONNX path expands it into `Reshape + MVN + Reshape + Multiply + Add` because opset 16 has no native GroupNorm").
+  3. **File size diff** -- `.xml` and `.bin` byte sizes for both IRs. Weights should be identical for the same model; `.xml` size usually drops on the leaner path.
+  4. **Recommendation** -- a short paragraph naming which IR is the better default for this model and why. Be honest when the two are within benchmark noise (say so explicitly rather than inventing a winner).
+
+The op-graph diff matters because latency alone doesn't tell you *why* one path is faster. Saying "direct path is 2% faster on GPU and compiles 23% faster because it kept `GroupNormalization` fused and has 131 fewer graph nodes" is an actionable insight; saying "direct path is 2% faster" is a coin flip that could reverse on the next OpenVINO release. Always include the structural explanation.
 
 ## 4. Inference Verification & Validation
 
@@ -172,13 +194,20 @@ Organize all outputs under the model repo root. The goal: anyone can use the exp
 export_<model_name>/
   <model_name>/                    # Model source code (cloned repo)
   converter/                       # Everything related to conversion
-    convert.py                     # Conversion script (ONNX export + OpenVINO conversion)
-    <model_name>_simplified.xml    # OpenVINO model structure
-    <model_name>_simplified.bin    # OpenVINO FP16 weights
+    convert.py                     # ONNX-path script: torch -> ONNX -> onnxsim -> OV IR
+    convert_direct.py              # Direct-path script: torch -> OV IR via ov.convert_model()
+                                   # (omit when only Path B was viable; note the reason in the report)
+    <model_name>_simplified.xml    # OpenVINO IR from ONNX path
+    <model_name>_simplified.bin
+    <model_name>_direct.xml        # OpenVINO IR from direct path (when Path A succeeds)
+    <model_name>_direct.bin
   benchmark/                       # All benchmark data
-    benchmark_cpu_result.txt       # Raw benchmark_app CPU log
-    benchmark_gpu_result.txt       # Raw benchmark_app GPU log
-    benchmark_app_usage.md         # benchmark_app usage guide
+    benchmark_cpu_result.txt           # ONNX-path CPU log
+    benchmark_gpu_result.txt           # ONNX-path GPU log
+    benchmark_cpu_direct_result.txt    # Direct-path CPU log (when Path A succeeds)
+    benchmark_gpu_direct_result.txt    # Direct-path GPU log (when Path A succeeds)
+    comparison_onnx_vs_direct.md       # Side-by-side latency + op-graph diff + recommendation
+    benchmark_app_usage.md             # benchmark_app usage guide
   validation/                      # Numerical accuracy validation
     validate.py                    # Automated in-process comparison: source-CPU-FP16 vs OV-GPU-FP16
     validation_report.md           # Validation results, metrics, and explicit comparison pair
@@ -194,8 +223,10 @@ export_<model_name>/
 
 Include a complete "reproduce from scratch" section:
 1. Environment and dependency installation
-2. Full ONNX export and conversion steps (pointing to `converter/convert.py`)
-3. How to run benchmarks and interpret results
+2. Conversion steps for **both** paths when available:
+   - `converter/convert_direct.py` -- direct torch/TF -> OV IR (Path A, default)
+   - `converter/convert.py` -- ONNX intermediate route (Path B, fallback and reference)
+3. How to run benchmarks and interpret results, including a pointer to `benchmark/comparison_onnx_vs_direct.md` when both IRs exist
 4. How to run numerical validation (pointing to `validation/validate.py` and `validation/validation_report.md`)
 5. How to run the inference demo and use custom data
 
@@ -229,10 +260,14 @@ Before delivering results to the user, verify every item. This catches common om
 
 - [ ] `export_<model_name>/` directory exists with correct structure
 - [ ] `<model_name>/` contains the cloned model source code
-- [ ] `converter/convert.py` exists and is runnable end-to-end
+- [ ] **Path A attempted first** (`convert_direct.py` using `ov.convert_model()`) -- success or failure documented in the conversion report
+- [ ] If Path A succeeded: `converter/convert_direct.py` exists and is runnable, and `converter/<model>_direct.xml` + `.bin` exist and are non-empty
+- [ ] `converter/convert.py` (ONNX-path) exists and is runnable end-to-end
 - [ ] `converter/<model_name>_simplified.xml` and `.bin` exist and are non-empty
 - [ ] `benchmark/benchmark_cpu_result.txt` exists, produced by `benchmark_app -m <model> -d CPU -hint latency -infer_precision f16`
 - [ ] `benchmark/benchmark_gpu_result.txt` exists, produced by `benchmark_app -m <model> -d GPU -hint latency -infer_precision f16`
+- [ ] If Path A succeeded: `benchmark/benchmark_cpu_direct_result.txt` and `benchmark/benchmark_gpu_direct_result.txt` also exist
+- [ ] If Path A succeeded: `benchmark/comparison_onnx_vs_direct.md` exists with latency table, op-graph counter diff, file-size diff, and a recommendation
 - [ ] `benchmark/benchmark_app_usage.md` exists with the exact commands above and parameter explanations
 - [ ] `validation/validate.py` exists and is runnable
 - [ ] `validation/validation_report.md` exists with pass/fail status and error metrics
@@ -261,4 +296,6 @@ Before delivering results to the user, verify every item. This catches common om
 ### Conversion report
 
 - [ ] Success: detailed step-by-step report with commands and outputs
+- [ ] Report names which path(s) were attempted and whether each succeeded or failed, with the reason
+- [ ] When both paths succeed, the report links to `benchmark/comparison_onnx_vs_direct.md` and states the chosen default IR
 - [ ] Failure: `<model>_OpenVINO_conversion_failure_analysis.md` with all attempts, errors, and root cause
