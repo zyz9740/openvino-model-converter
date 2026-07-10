@@ -1,65 +1,45 @@
 #!/usr/bin/env python3
 """
-OpenVINO 模型转换示例脚本
-修改以下配置参数即可直接运行
+OpenVINO conversion template (Lite skill).
+Adapt to the specific model: try direct export first, fall back to ONNX.
 """
-import subprocess
-import os
+import openvino as ov
 
-# ====================== 配置参数 - 请根据实际情况修改 ======================
-INPUT_MODEL_PATH = "your_model.onnx"  # 输入模型路径，支持.onnx/.pb/.caffemodel等
-OUTPUT_DIR = "./openvino_output"      # 输出目录
-INPUT_SHAPE = [1, 3, 224, 224]        # 输入形状，动态形状可设为None
-MEAN_VALUES = [123.675, 116.28, 103.53]  # 预处理均值，和训练保持一致
-SCALE_VALUES = [58.395, 57.12, 57.375]   # 预处理缩放值，和训练保持一致
-DATA_TYPE = "FP16"                    # 精度：FP32/FP16/INT8
-MODEL_NAME = "converted_model"        # 输出模型名称
-REVERSE_CHANNELS = False              # 是否反转输入通道（BGR<->RGB）
-# =========================================================================
+# ====================== Configure for the specific model ======================
+OUTPUT_XML = "converted_model.xml"   # output path, .bin is written alongside it
+INPUT_SHAPE = [1, 3, 224, 224]       # example_input shape for tracing
+# =================================================================================
+
+
+def convert_direct(model, example_input):
+    """Path A: direct torch/TF module -> OpenVINO IR."""
+    ov_model = ov.convert_model(model, example_input=example_input)
+    ov.save_model(ov_model, OUTPUT_XML, compress_to_fp16=True)
+    return ov_model
+
+
+def convert_via_onnx(onnx_path):
+    """Path B: ONNX intermediate -> OpenVINO IR (fallback if direct export fails)."""
+    ov_model = ov.convert_model(onnx_path)
+    ov.save_model(ov_model, OUTPUT_XML, compress_to_fp16=True)
+    return ov_model
+
 
 def main():
-    # 创建输出目录
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    # 构建命令
-    cmd = [
-        "mo",
-        "--input_model", INPUT_MODEL_PATH,
-        "--output_dir", OUTPUT_DIR,
-        "--data_type", DATA_TYPE,
-        "--model_name", MODEL_NAME
-    ]
-    
-    if INPUT_SHAPE is not None:
-        shape_str = "[" + ",".join(map(str, INPUT_SHAPE)) + "]"
-        cmd.extend(["--input_shape", shape_str])
-    
-    if MEAN_VALUES is not None:
-        mean_str = "[" + ",".join(map(str, MEAN_VALUES)) + "]"
-        cmd.extend(["--mean_values", mean_str])
-    
-    if SCALE_VALUES is not None:
-        scale_str = "[" + ",".join(map(str, SCALE_VALUES)) + "]"
-        cmd.extend(["--scale_values", scale_str])
-    
-    if REVERSE_CHANNELS:
-        cmd.append("--reverse_input_channels")
-    
-    print("执行转换命令：")
-    print(" ".join(cmd))
-    print("\n转换中...")
-    
-    # 执行转换
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode == 0:
-        print("\n✅ 转换成功！")
-        print(f"输出文件保存在：{os.path.abspath(OUTPUT_DIR)}")
-        print(f"生成文件：{MODEL_NAME}.xml、{MODEL_NAME}.bin")
-    else:
-        print("\n❌ 转换失败！")
-        print("错误信息：")
-        print(result.stderr)
+    import torch
+
+    # Replace with the actual model class + weight loading for this repo.
+    # model = MyModel()
+    # model.load_state_dict(torch.load("checkpoint.pt", map_location="cpu"))
+    # model.eval()
+    # example_input = torch.randn(*INPUT_SHAPE)
+
+    raise NotImplementedError(
+        "Fill in model construction, weight loading, and example_input, "
+        "then call convert_direct(model, example_input); if that raises, "
+        "export ONNX with torch.onnx.export(...) and call convert_via_onnx(path)."
+    )
+
 
 if __name__ == "__main__":
     main()
