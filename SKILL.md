@@ -24,7 +24,7 @@ Follow this sequence for every conversion, whether it succeeds or fails:
 4. **Validate** -- verify OpenVINO IR (GPU) outputs match original framework (CPU) outputs
 5. **Verify** -- write and run an inference demo with real data, show results to user
 6. **Document** -- write conversion report and README
-7. **Deliver** -- organize all files into the standard export directory
+7. **Deliver** -- organize all files into the standard export directory, then ask the user if they want to pursue optimization; if so, recommend a per-layer IR profile first (see Section 3's "Optional: per-layer IR profiling" and Section 6's closing question)
 8. **(Optional) CUDA fused-op migration** -- if the source repo contains hand-written CUDA kernels for fused operations AND the baseline conversion passes cleanly, profile the equivalent subgraph on OV-GPU, propose a custom-op port, and -- only with the user's explicit agreement -- build an `optimize_v2/` rerun. See Section 7.
 
 If conversion fails, still complete steps 6-7 (failure report + root cause analysis). Step 8 is skipped on failed conversions -- there is nothing to optimize on top of a broken baseline.
@@ -128,6 +128,17 @@ Additional files to save under `benchmark/`:
   4. **Recommendation** -- a short paragraph naming which IR is the better default for this model and why. Be honest when the two are within benchmark noise (say so explicitly rather than inventing a winner).
 
 The op-graph diff matters because latency alone doesn't tell you *why* one path is faster. Saying "direct path is 2% faster on GPU and compiles 23% faster because it kept `GroupNormalization` fused and has 131 fewer graph nodes" is an actionable insight; saying "direct path is 2% faster" is a coin flip that could reverse on the next OpenVINO release. Always include the structural explanation.
+
+### Optional: per-layer IR profiling
+
+`benchmark_app`'s headline latency/throughput numbers say *how fast*, not *where the time goes inside the graph*. When the user wants to optimize (rather than just ship the baseline), re-run `benchmark_app` with `-exec_graph_path` to get a per-layer breakdown -- no extra tooling required:
+
+```bash
+benchmark_app -m <model.xml> -d GPU -hint latency -infer_precision f16 \
+    -niter 50 -exec_graph_path exec_graph.xml
+```
+
+This is not part of the required benchmarking flow -- run it on request, or proactively offer it once conversion is complete (see Section 6). Full method, the two available flags (`-pc` vs `-exec_graph_path`), what each layer's attributes mean, and how to read the results: `references/per-layer-profiling.md`.
 
 ## 4. Inference Verification & Validation
 
@@ -400,6 +411,16 @@ Also include a short "What's in this repo and what isn't" section near the top, 
 
 Keep the file listing in README synchronized with actual directory contents.
 
+### Closing question: offer per-layer profiling
+
+Once delivery is complete (conversion, benchmark, validation, demo, README all done), ask the user once whether they want to pursue optimization. If they do, recommend running a per-layer IR profile first -- it's what turns "make it faster" into a concrete target instead of guesswork. Use wording along these lines:
+
+> The conversion is complete and delivered. If you're interested in optimizing further, I'd recommend starting with a per-layer performance profile of the IR (`benchmark_app -exec_graph_path`) to see exactly which layers dominate inference time before deciding where to focus. Want me to run that?
+
+If the user agrees, follow `references/per-layer-profiling.md` (also summarized in Section 3) and report the top hot layers by name, type, and share of total time. If the hot layers trace back to a hand-written CUDA fused kernel in the source repo, this is also the natural segue into Section 7 (Stage 8) -- mention it as a possible next step, but don't start Stage 8 without going through its own trigger check and decision gate.
+
+Don't run this profiling unprompted -- it's an optional add-on to a completed delivery, not a required step, so wait for the user's answer before spending the extra `benchmark_app` run.
+
 ---
 
 ## 7. (Optional) CUDA Fused-Op Migration to OpenVINO Custom Op
@@ -534,6 +555,7 @@ The verdict matters more than the speedup number. A 30% speedup that fails B is 
 ### References (`references/`)
 
 - **`hf-mirror-guide.md`** -- How to configure HuggingFace mirror (hf-mirror.com) for downloading models and datasets in China. Read this whenever the model or weights are hosted on HuggingFace.
+- **`per-layer-profiling.md`** -- How to get per-layer timing out of a converted IR using `benchmark_app -exec_graph_path` (or `-pc`), what each layer's attributes mean, and how to read the results. Read this when the user wants to optimize and needs to know which layers dominate inference time (see Section 3 and the closing question in Section 6).
 
 ## Platform Notes
 
@@ -600,6 +622,7 @@ Before delivering results to the user, verify every item. This catches common om
 - [ ] Report names which path(s) were attempted and whether each succeeded or failed, with the reason
 - [ ] When both paths succeed, the report links to `benchmark/comparison_onnx_vs_direct.md` and states the chosen default IR
 - [ ] Failure: `<model>_OpenVINO_conversion_failure_analysis.md` with all attempts, errors, and root cause
+- [ ] On success, the user was asked whether they want to pursue optimization, with a recommendation to start with a per-layer IR profile (`references/per-layer-profiling.md`) if so
 
 ### Stage 8 (only if triggered -- see Section 7)
 
