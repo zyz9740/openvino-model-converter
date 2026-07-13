@@ -12,7 +12,10 @@ description: >
 # OpenVINO Model Converter (Lite)
 
 Convert AI models to OpenVINO IR fast: acquire source, convert, benchmark on GPU, quick-validate,
-demo, deliver. This is the token-lite variant -- see **Limitations** below for what it trades away.
+demo, deliver reproducibly. This is the token-lite variant -- see **Limitations** below for what
+it trades away (single conversion path, GPU-only benchmark, single validation comparison, no CUDA
+migration). File-management and reproducibility discipline (git hygiene, `.gitignore`,
+`fetch_assets.py`, size audits) is kept in full -- that part isn't where the token cost was.
 
 ## Limitations (read before running)
 
@@ -24,8 +27,11 @@ This skill optimizes for speed and low token cost over exhaustive rigor:
 - **Single conversion path** -- ships whichever of direct-export/ONNX succeeds first. Does not
   build both and compare, so it may not be the leanest/fastest possible IR for that model.
 - **GPU-only benchmark** -- no CPU baseline, no cross-device comparison.
-- **No auto weight download, no provenance/fetch_assets machinery** -- weight download is left
-  to the user, but you must give them a concrete command they can run directly.
+- **No auto weight download during the session** -- the skill writes a `scripts/fetch_assets.py`
+  manifest (URL, dest path, sha256, size) for weights and large test data, but the user runs it
+  themselves; the skill never downloads or polls in-session. File-management/reproducibility
+  policy (`.gitignore`, committed-vs-derived, push-size audit) is otherwise unchanged from the
+  full skill -- see Section 6.
 - **No CUDA fused-op migration path** -- if a model relies on custom CUDA kernels that block
   conversion, this skill reports the failure and stops; it does not attempt to port them.
 - **Bail out on hard problems** -- at any step (convert, benchmark, validate, demo), if an error
@@ -38,7 +44,7 @@ migration, say so explicitly rather than silently doing the lighter version.
 
 ## Workflow
 
-1. **Acquire** -- clone source repo; give the user an executable weight download command, don't fetch weights yourself
+1. **Acquire** -- clone source repo (de-submodule it), write `fetch_assets.py` for weights, don't fetch them yourself
 2. **Convert** -- try direct export, fall back to ONNX; first success ships; both-fail = stop and report
 3. **Benchmark** -- `benchmark_app` on GPU only
 4. **Validate** -- OV-GPU-FP16 vs original framework, ~10 random inputs, no plots
@@ -47,34 +53,29 @@ migration, say so explicitly rather than silently doing the lighter version.
 
 ## 1. Acquire
 
+### Source code
+
 - Clone the model repo (`--depth 1` if large) into `<model_name>/` under the export directory.
+- Cloning leaves a nested `.git` inside `<model_name>/`. Remove it
+  (`rm -rf <model_name>/.git`) once cloned -- otherwise, once the export directory itself becomes
+  a git repo, that nested `.git` turns into an accidental embedded-repo/submodule reference that
+  breaks on a fresh clone elsewhere. Record the source commit hash/tag in the conversion report
+  instead of relying on git to track it.
+
+### Pretrained weights
+
 - Search the repo's README/releases for official pretrained weights. **Do not download them
-  yourself.** Give the user the direct URL, approximate file size, where to place the file, and
-  one explicit copy/paste command that downloads the weight file(s) into that exact location --
-  then wait. No polling, no retries, no background waiting.
-- Prefer commands that work in the user's current shell/OS. On Windows PowerShell, use
-  `Invoke-WebRequest -Uri "<url>" -OutFile "<absolute_weight_path>"` for direct files, or
-  `huggingface-cli download <org>/<model> --local-dir "<absolute_weights_dir>" --local-dir-use-symlinks False`
-  for HuggingFace repos. On Linux/macOS, use `curl -L "<url>" -o "<absolute_weight_path>"`
-  for direct files, or the same `huggingface-cli download ...` form for HuggingFace repos.
-- If weights are on HuggingFace, include the mirror setup inline before the download command
-  when useful (for example, `$env:HF_ENDPOINT = "https://hf-mirror.com"` on PowerShell or
-  `export HF_ENDPOINT=https://hf-mirror.com` on Linux/macOS), and point the user at
-  `references/hf-mirror-guide.md` for details.
-- The user-facing instruction must include a fenced command block and be immediately runnable,
-  for example:
-
-  ```powershell
-  New-Item -ItemType Directory -Force "<absolute_weights_dir>"
-  Invoke-WebRequest -Uri "<direct_weight_url>" -OutFile "<absolute_weight_path>"
-  ```
-
-  or:
-
-  ```powershell
-  $env:HF_ENDPOINT = "https://hf-mirror.com"
-  huggingface-cli download <org>/<model> --local-dir "<absolute_weights_dir>" --local-dir-use-symlinks False
-  ```
+  yourself and do not poll/retry in-session.** Instead, add an entry to
+  `scripts/fetch_assets.py`'s manifest (copy `scripts/fetch_assets_template.py`, fill in `url`,
+  `dest_path`, `size_bytes`, `description`; if HuggingFace-hosted, use the hf-mirror.com URL as
+  `url` and the original huggingface.co URL as an `alternate_urls` entry -- see
+  `references/hf-mirror-guide.md`).
+- `sha256`: if the source publishes an official checksum, use it. Otherwise leave a placeholder
+  (e.g. `"UNVERIFIED-fill-after-first-download"`) and tell the user the script will print the
+  actual hash on first run so they can lock it into the manifest.
+- Tell the user to run `python scripts/fetch_assets.py` themselves to fetch the weights (and any
+  large test inputs) -- then wait. This is the one command they need; don't also invent an ad hoc
+  curl/Invoke-WebRequest one-off.
 - If no weights are available, proceed with random input for validation/demo and say so.
 
 ## 2. Convert
@@ -88,7 +89,7 @@ do not build both.
 2. **ONNX fallback** (only if direct export raises): export to ONNX, optionally run `onnxsim`,
    then `openvino.convert_model("<model>.onnx")` / `ovc`.
 3. **Both fail** -- this is a hard stop. Do not try workarounds indefinitely. Write the failure
-   report (Section 5) with every attempted approach, the exact error, and a root-cause guess
+   report (Section 6) with every attempted approach, the exact error, and a root-cause guess
    (e.g. "custom CUDA kernel with no CPU/ONNX equivalent"), then tell the user conversion did
    not succeed. This is the expected outcome for CUDA-only fused ops -- do not attempt to port them.
    (This is the Convert-step instance of the general "bail out on hard problems" rule above.)
@@ -137,12 +138,22 @@ endlessly patching it.
 
 ## 6. Deliver
 
+The export directory is meant to become a git repo pushed to GitHub -- a fresh `git clone` plus
+`fetch_assets.py` plus `convert.py` must let *the user* reproduce everything later. The skill
+itself never runs `fetch_assets.py` (or waits on a download) during the session -- it only
+authors the manifest and hands the one command off, per Section 1.
+
 ```
 export_<model_name>/
-  <model_name>/              # cloned source (weights excluded -- user downloads separately)
+  .gitignore                       # excludes derived/large files (see below)
+  requirements.txt
+  scripts/
+    fetch_assets.py                # weight + large-test-data manifest, SHA256-verified (Section 1)
+  <model_name>/                    # cloned source, nested .git removed (Section 1)
   converter/
-    convert.py                # whichever path succeeded
-    <model_name>.xml / .bin   # OpenVINO IR (FP16)
+    convert.py                     # whichever path succeeded
+    <model_name>.xml               # OpenVINO IR graph -- COMMIT (text, small)
+    <model_name>.bin               # (derived) IR weights -- NOT committed; rebuild with convert.py
   benchmark/
     benchmark_gpu_result.txt
   validation/
@@ -150,14 +161,43 @@ export_<model_name>/
     validation_report.md
   demo/
     infer_demo.py
-  README.md                   # setup + how to run each step
+  README.md
   <model>_conversion_report.md          # on success: steps + key results
-  <model>_conversion_failure_analysis.md # on failure: attempts + root cause (see 2.3)
+  <model>_conversion_failure_analysis.md # on failure: attempts + root cause (see Section 2)
 ```
 
-README should cover: environment setup, where to get weights (link + placement + executable
-download command, per Section 1), how to run `convert.py`, `benchmark_app`, `validate.py`, and
-`infer_demo.py`. Keep it short.
+### Committed vs. derived
+
+Never commit a file that `fetch_assets.py` or `convert.py` can reproduce -- GitHub rejects any
+file over 100 MB and a bloated history is painful to fix later.
+
+| Category | Examples | Treatment |
+|----------|----------|-----------|
+| Source, configs, reports, logs | `.py`, `requirements.txt`, `.md`, `.txt`, `.json` | Commit |
+| OV IR graph | `.xml` | Commit (text, usually small) |
+| Small test inputs | sample images < 95 MB | Commit |
+| OV IR weights | `.bin` | **Derived** -- rebuilt by `convert.py` |
+| ONNX intermediate | `.onnx` | **Derived** -- rebuilt by `convert.py` |
+| Pretrained weights | `.pt`/`.pth`/`.ckpt`/`.h5`/`.safetensors` | **Derived** -- fetched by `fetch_assets.py` |
+| Large test inputs | any file > 95 MB | **Derived** -- fetched by `fetch_assets.py` |
+
+Write `.gitignore` at the export root covering `*.bin`, `*.onnx`, and whatever pretrained-weight
+extensions this model uses (`*.pt`, `*.pth`, `*.ckpt`, `*.h5`, `*.safetensors`, ...), plus the
+usual `__pycache__/`, `*.pyc`, `.venv/`.
+
+Before telling the user it's ready to push, run a size audit and fix `.gitignore` if anything
+over 95 MB comes back (don't fight it at the server with `--force`):
+
+```bash
+git ls-files -z | xargs -0 -I{} stat -c "%s %n" "{}" | awk '$1 > 95000000 {print}'
+```
+
+No Git LFS (bandwidth-capped on free accounts) and no GitHub Releases assets (a second source of
+truth that drifts) -- the fetch-from-source + convert-from-source approach is the only path.
+
+README should cover: environment setup, running `scripts/fetch_assets.py` to restore weights/large
+inputs, running `convert.py`, `benchmark_app`, `validate.py`, and `infer_demo.py`, and a short
+"what's in this repo and what isn't" note pointing at `fetch_assets.py`/`convert.py`. Keep it short.
 
 ## Platform Notes
 
@@ -168,20 +208,25 @@ download command, per Section 1), how to run `convert.py`, `benchmark_app`, `val
 
 - **`scripts/example_convert.py`** -- starting template for `converter/convert.py` (direct path,
   ONNX fallback).
+- **`scripts/fetch_assets_template.py`** -- copy into each export's `scripts/fetch_assets.py` and
+  fill in the manifest (URL, dest path, sha256, size, description) per Section 1/6. Implements
+  SHA256 verification and skip-if-present.
 - **`references/hf-mirror-guide.md`** -- HuggingFace mirror setup, for when the user downloads
-  weights themselves.
+  weights themselves via `fetch_assets.py`.
 
 ## Completion Checklist
 
-- [ ] `export_<model_name>/<model_name>/` has the cloned source; weight download link and a
-  directly executable download command (not the file) were handed to the user if weights are
-  large/remote
+- [ ] `export_<model_name>/<model_name>/` has the cloned source with its nested `.git` removed
+- [ ] `scripts/fetch_assets.py` exists with a filled-in manifest for weights/large test data;
+      the skill did not download them itself
 - [ ] `converter/convert.py` exists and produces `<model>.xml` + `.bin` (FP16), OR a failure
       report was written and the user was told conversion did not succeed
 - [ ] `benchmark/benchmark_gpu_result.txt` exists from a GPU `-hint latency -infer_precision f16` run
 - [ ] `validation/validate.py` ran ~10+ inputs, comparing OV-GPU-FP16 vs the original framework,
       and `validation_report.md` states a verdict
 - [ ] `demo/infer_demo.py` runs and its output was shown to the user
-- [ ] `README.md` covers setup, weight acquisition with an executable command,
-      convert/benchmark/validate/demo steps
+- [ ] `.gitignore` excludes `.bin`/`.onnx`/pretrained-weight extensions; a size audit
+      (`git ls-files` + `stat` over 95 MB) came back empty before telling the user to push
+- [ ] `README.md` covers setup, `fetch_assets.py`, convert/benchmark/validate/demo steps, and
+      a short "what's in this repo and what isn't" note
 - [ ] Conversion report (success) or failure analysis (failure) was written
