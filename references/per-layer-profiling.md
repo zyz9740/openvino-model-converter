@@ -55,6 +55,42 @@ Outputs:
 - `exec_graph.xml` -- the useful artifact, one `<layer>` per compiled node
 - `exec_graph.bin` -- empty placeholder, ignore it (not real weights)
 
+## Alternative: Python API with `PERF_COUNT`
+
+Use `benchmark_app` by default -- it's simpler and needs no code. Fall
+back to the Python API only when the user needs to compile against a
+shared GPU context, or wants to mirror what their own inference
+pipeline does rather than a standalone `benchmark_app` process:
+
+```python
+import openvino as ov
+from openvino import Core
+
+core = Core()
+model = core.read_model("model.xml")
+
+cfg = {
+    "PERFORMANCE_HINT": "LATENCY",
+    "INFERENCE_PRECISION_HINT": "f16",
+    "PERF_COUNT": "YES",   # without this, every execTimeMcs is 0
+}
+
+compiled = core.compile_model(model, "GPU", cfg)
+req = compiled.create_infer_request()
+
+# Warm up -- first inferences include JIT compilation
+for _ in range(15):
+    req.infer()
+
+# Only the LAST inference's per-layer timing is captured
+ov.save_model(compiled.get_runtime_model(), "exec_graph.xml")
+```
+
+`PERF_COUNT=YES` is mandatory -- without it the XML still serializes
+fine but every `execTimeMcs` is `0`. The resulting `exec_graph.xml` has
+the same per-layer attributes and is read the same way as the
+`benchmark_app` output above.
+
 ## What each layer's `<data>` carries
 
 | Attribute | Meaning |
