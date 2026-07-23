@@ -37,9 +37,9 @@ cp "$SCRIPT_DIR/SKILL.md" "$INSTALL_DIR/"
 # Show installed location (convert back to Windows path if on Windows)
 if [ -n "$USERPROFILE" ]; then
     WIN_PATH="$(cygpath -w "$INSTALL_DIR" 2>/dev/null || echo "$INSTALL_DIR")"
-    echo "✓ Installed to: $WIN_PATH"
+    echo "[OK] Installed to: $WIN_PATH"
 else
-    echo "✓ Installed to: $INSTALL_DIR"
+    echo "[OK] Installed to: $INSTALL_DIR"
 fi
 
 echo ""

@@ -20,7 +20,7 @@ Follow this sequence for every conversion, whether it succeeds or fails:
 
 1. **Acquire model & weights** -- clone source repo and download pretrained weights
 2. **Convert model** -- export to ONNX, optimize, convert to OpenVINO IR
-3. **Benchmark** -- run `benchmark_app` on CPU and GPU
+3. **Benchmark** -- run `benchmark_app` on GPU
 4. **Validate** -- verify OpenVINO IR (GPU) outputs match original framework (CPU) outputs
 5. **Verify** -- write and run an inference demo with real data, show results to user
 6. **Document** -- write conversion report and README
@@ -49,15 +49,13 @@ Getting the complete model source code is critical -- many models have custom op
 
 ## 2. Model Conversion
 
-There are two main paths to get an OpenVINO IR model. The conversion toolchain is never a pure formality -- it can leave a different op graph even for the same model, which in turn changes compile time and sometimes runtime speed. So the policy is: **try the direct path first, and when it works, also run the ONNX path so the user can see the real trade-off on their model**.
+OpenVINO supports two well-established routes to an IR model, and both are first-class. The policy is: **try the direct path first; if it succeeds, use it and stop there. Only fall through to the ONNX path when the direct path doesn't work (or doesn't apply).**
 
-### Default order: Path A first, then Path B
+### Default order: Path A first, then Path B only if needed
 
-1. **Always attempt Path A (direct torch/TF -> OpenVINO IR) first.** In practice direct export tends to produce a leaner graph -- fewer `Reshape`/`Unsqueeze` bookkeeping ops, modern fused ops kept whole (e.g. `GroupNormalization`, `ScaledDotProductAttention`) rather than decomposed into ONNX-opset-era primitives. That usually means lower GPU compile time, sometimes lower runtime latency, and a smaller `.xml`. But direct export can also fail on exotic ops or custom control flow, which is why it isn't a hard rule.
-2. **If Path A fails, fall back to Path B (ONNX intermediate).** ONNX has broader op coverage and a more mature fallback-friendly toolchain; many models that won't trace through `ov.convert_model()` directly will still export cleanly to ONNX and convert from there.
-3. **If Path A succeeds, still run Path B as well.** Build both IRs, benchmark both, compare the graphs. The result is what the user actually cares about -- is the direct path really faster for *this* model? Sometimes it is by double digits, sometimes it's a wash, and occasionally Path B wins because ONNX simplification folds constants more aggressively. The only way to know is to measure. See Section 3 for the comparison requirements.
-
-Refer to `scripts/example_convert.py` as a starting template and adapt it to the specific model.
+1. **Start with Path A (direct torch/TF -> OpenVINO IR).** OpenVINO's frontends convert most models directly, and the direct route tends to produce a leaner graph -- fewer `Reshape`/`Unsqueeze` bookkeeping ops, modern fused ops kept whole (e.g. `GroupNormalization`, `ScaledDotProductAttention`) rather than decomposed into ONNX-opset-era primitives. That usually means lower GPU compile time, sometimes lower runtime latency, and a smaller `.xml`. It is the natural default.
+2. **If Path A succeeds, use it and stop.** There is no need to also run Path B once a clean direct IR exists -- it would just spend time producing a second artifact the user won't use.
+3. **Path B (ONNX intermediate) is the fallback route.** Use it only when Path A doesn't apply or doesn't work: the source ships only an `.onnx` file with no torch/TF module, or a model uses an op or control-flow pattern the direct frontend hasn't caught up to yet. The ONNX opset is broad and the `onnxsim` -> `ovc` toolchain is well-trodden, so it converts a wide range of models cleanly when Path A can't.
 
 ### Path A: Direct export to OpenVINO IR
 
@@ -76,9 +74,9 @@ Refer to `scripts/example_convert.py` as a starting template and adapt it to the
 
 | Situation | What to do |
 |-----------|------------|
-| PyTorch module with standard ops | Path A first; if it succeeds, also run Path B and compare |
-| TensorFlow SavedModel | Path A first; if it succeeds, also run Path B and compare |
-| Path A fails (tracing error, unsupported op) | Fall back to Path B; document the failure in the conversion report |
+| PyTorch module with standard ops | Path A; use it once it succeeds, no need for Path B |
+| TensorFlow SavedModel | Path A; use it once it succeeds, no need for Path B |
+| Path A doesn't cover a specific op/control-flow pattern | Fall through to Path B for that model; note in the conversion report which route was used and why |
 | Model repo only provides a `.onnx` file, no source | Path B only -- there is no torch module to hand to `ov.convert_model()` |
 | Custom/exotic operators | Path B with careful opset selection, or Path A with `ov_extension` |
 
@@ -86,10 +84,10 @@ Always default to FP16 precision for a good balance of model size and accuracy.
 
 ### Key considerations
 
-- When both paths work, keep both IRs in `converter/` (e.g. `<model>_direct.xml` and `<model>_simplified.xml`) and write ONE shared model-build/patch module that both `convert.py` (ONNX path) and `convert_direct.py` (direct path) import. Duplicating the patching logic across two scripts is a maintenance hazard.
+- If Path A doesn't succeed and you fall through to Path B, keep the shared model-build/patch module in `converter/` reusable so `convert_direct.py` (if you keep the failed attempt around for the report) and `convert.py` (ONNX path) don't duplicate patching logic. Duplicating it across two scripts is a maintenance hazard.
 - Check the model repo for existing export examples or scripts (ONNX or OpenVINO) -- reuse them rather than writing from scratch, because model authors know their own edge cases best
 - Handle dynamic shapes carefully -- some models need explicit static shape setting for OpenVINO compatibility
-- If Path A fails, try Path B before giving up. Document every attempt in the failure report.
+- If a specific model doesn't convert cleanly through Path A, run it through Path B before concluding it can't be converted. Document every attempt in the report.
 
 ## 3. Performance Benchmarking
 
@@ -97,32 +95,29 @@ Use OpenVINO's official `benchmark_app` tool exclusively. Custom Python timing s
 
 ### Required command
 
-Run `benchmark_app` with the exact flags below on both CPU and GPU. The `-hint latency` + `-infer_precision f16` combination matches how the model is exported (FP16) and produces latency numbers that reflect real single-request deployment:
+Run `benchmark_app` with the exact flags below on GPU -- GPU is the deployment target this skill delivers against, so that is where the performance numbers matter. The `-hint latency` + `-infer_precision f16` combination matches how the model is exported (FP16) and produces latency numbers that reflect real single-request deployment:
 
 ```bash
-benchmark_app -m <model.xml> -d CPU -hint latency -infer_precision f16
 benchmark_app -m <model.xml> -d GPU -hint latency -infer_precision f16
 ```
 
-Do not substitute other hints (e.g. `throughput`) or precisions unless the user explicitly requests it -- the FP16 latency hint is the contract this skill delivers against.
+Do not substitute other hints (e.g. `throughput`) or precisions unless the user explicitly requests it -- the FP16 latency hint is the contract this skill delivers against. Only add a CPU run (`-d CPU`) if the user explicitly asks to see CPU numbers; it is not part of the default flow.
 
 - Save raw output logs -- these are the authoritative source of truth:
-  - `benchmark_cpu_result.txt` -- full CPU test log for the primary IR (Path A if it succeeded, otherwise Path B)
-  - `benchmark_gpu_result.txt` -- full GPU test log for the primary IR
+  - `benchmark_gpu_result.txt` -- full GPU test log for the primary IR (Path A if it succeeded, otherwise Path B)
   - `benchmark_app_usage.md` -- the exact commands used, parameter explanations, how to read results
-- Use `scripts/parse_benchmark.py` to extract key metrics (latency, throughput, device info) from raw logs for structured summaries
 - When reporting performance numbers in README or to the user, always cite the exact log file path. Every number must trace back to `benchmark_app` output -- never approximate or editorialize performance data, because users rely on these numbers for hardware purchasing and deployment decisions
 
-### Path A vs Path B comparison (required when both paths succeed)
+### Path A vs Path B comparison (only if the user explicitly wants both IRs)
 
-Whenever Section 2 yields two IRs -- one from direct export (Path A) and one from the ONNX route (Path B) -- you must benchmark **both** and produce an explicit comparison. This is the whole reason we bothered to build two IRs; a conversion report that only includes one set of numbers is throwing away the most useful information the skill produces.
+By default Section 2 produces exactly one IR -- Path A if it succeeded, otherwise Path B -- so there is normally nothing to compare. If the user explicitly asks to see both routes side by side (e.g. to double-check Path A's result, or because they're evaluating which route to standardize on), build both IRs, benchmark both, and produce an explicit comparison.
 
 Additional files to save under `benchmark/`:
 
-- `benchmark_cpu_direct_result.txt`, `benchmark_gpu_direct_result.txt` -- logs for the direct-path IR
-- (The ONNX-path logs live in the standard `benchmark_cpu_result.txt` / `benchmark_gpu_result.txt`, so both sides are preserved.)
+- `benchmark_gpu_direct_result.txt` -- GPU log for the direct-path IR
+- (The ONNX-path GPU log lives in the standard `benchmark_gpu_result.txt`, so both sides are preserved.)
 - `comparison_onnx_vs_direct.md` -- written comparison, covering:
-  1. **Latency table (CPU & GPU)** -- median, average, min, throughput, first-inference, compile-time for both IRs, with the percent delta. Pull numbers straight from the raw logs.
+  1. **Latency table (GPU)** -- median, average, min, throughput, first-inference, compile-time for both IRs, with the percent delta. Pull numbers straight from the raw logs.
   2. **Op-graph diff** -- load both IRs with `ov.Core().read_model()`, walk `model.get_ops()`, and print a `collections.Counter` of op type names. Put both counters side-by-side in the report and call out specific differences (e.g. "direct path keeps `GroupNormalization`; ONNX path expands it into `Reshape + MVN + Reshape + Multiply + Add` because opset 16 has no native GroupNorm").
   3. **File size diff** -- `.xml` and `.bin` byte sizes for both IRs. Weights should be identical for the same model; `.xml` size usually drops on the leaner path.
   4. **Recommendation** -- a short paragraph naming which IR is the better default for this model and why. Be honest when the two are within benchmark noise (say so explicitly rather than inventing a winner).
@@ -287,9 +282,7 @@ export_<model_name>/
     <model_name>_direct.bin        # (derived) -- NOT committed; rebuild with convert_direct.py
     <model_name>.onnx              # (derived) ONNX intermediate -- NOT committed; rebuild with convert.py
   benchmark/                       # All benchmark data (text logs, all committed)
-    benchmark_cpu_result.txt           # ONNX-path CPU log
     benchmark_gpu_result.txt           # ONNX-path GPU log
-    benchmark_cpu_direct_result.txt    # Direct-path CPU log (when Path A succeeds)
     benchmark_gpu_direct_result.txt    # Direct-path GPU log (when Path A succeeds)
     comparison_onnx_vs_direct.md       # Side-by-side latency + op-graph diff + recommendation
     benchmark_app_usage.md             # benchmark_app usage guide
@@ -400,10 +393,10 @@ Include a complete "reproduce from scratch" section. Order matters here -- a fre
 
 1. **Environment**: `pip install -r requirements.txt`
 2. **Fetch large derived assets**: `python scripts/fetch_assets.py` -- explain that this downloads pretrained weights and any large test inputs from their origins, with SHA256 verification. List which files appear after this step.
-3. **Conversion** (rebuilds `.bin` and `.onnx` locally), for **both** paths when available:
-   - `converter/convert_direct.py` -- direct torch/TF -> OV IR (Path A, default)
-   - `converter/convert.py` -- ONNX intermediate route (Path B, fallback and reference)
-4. How to run benchmarks and interpret results, including a pointer to `benchmark/comparison_onnx_vs_direct.md` when both IRs exist
+3. **Conversion** (rebuilds `.bin` and `.onnx` locally):
+   - `converter/convert_direct.py` -- direct torch/TF -> OV IR (Path A, default, used whenever it succeeds)
+   - `converter/convert.py` -- ONNX intermediate route (Path B, fallback route -- only present if Path A failed, or if the user explicitly asked for both)
+4. How to run benchmarks and interpret results, including a pointer to `benchmark/comparison_onnx_vs_direct.md` if both IRs exist
 5. How to run numerical validation (pointing to `validation/validate.py` and `validation/validation_report.md`)
 6. How to run the inference demo and use custom data
 
@@ -425,122 +418,19 @@ Don't run this profiling unprompted -- it's an optional add-on to a completed de
 
 ## 7. (Optional) CUDA Fused-Op Migration to OpenVINO Custom Op
 
-This stage exists because many high-performance model repos ship hand-written CUDA kernels that fuse multiple ops into one launch (e.g. a fused attention, a fused voxelization, a fused decoder head). On NVIDIA hardware this is a clear win. On Intel GPU through OpenVINO, the equivalent subgraph is whatever the IR's stock op decomposition gives us, which is rarely as tight. If the user is targeting Intel deployment, leaving that fusion on the table is exactly the kind of thing this skill should surface.
+Many high-performance model repos ship hand-written CUDA kernels that fuse multiple ops into one launch (fused attention, fused voxelization, a fused decoder head, ...). This shows up in two different cases, and they are not equally optional -- always check for case A before considering case B:
 
-But this is **optional, opt-in work**. It costs real time (kernel writing, integration, re-validation), and it is only justified when (a) a fused CUDA kernel actually exists in the source repo and (b) the baseline OV conversion is otherwise healthy. Doing it on a broken baseline just stacks two sources of error.
+- **A. Conversion failed because of the CUDA op (check this first).** If Path A and Path B (of the main conversion flow above) both fail (or fail to trace/export) specifically because a hand-written CUDA kernel has no ONNX/OV equivalent, porting it to a custom op is the only way to get a convertible model at all -- there's no benchmark or validation to run otherwise. Treat this as required work once confirmed, not a discretionary optimization.
+- **B. Conversion succeeded, now optimizing (only relevant once case A doesn't apply).** On Intel GPU through OpenVINO the equivalent subgraph is whatever the IR's stock op decomposition gives, so if the user is targeting Intel deployment there may be a fusion opportunity worth surfacing. This one genuinely is opt-in -- the model already ships without it.
 
-### 7.1 Trigger conditions -- both must hold
+Both cases still gate on:
 
-Run this stage only when ALL of the following are true:
+- The cloned source repo contains hand-written CUDA (`.cu`/`.cuh`, `__global__`, a `cpp_extension`/`setup.py` CUDA build) implementing a **fused** op -- plain CUDA-via-PyTorch like `torch.bmm` does not count, it's already covered by stock OV ops.
+- Either conversion failed and the documented root cause traces back to that CUDA op (case A, higher priority), OR Sections 1-6 all passed cleanly (conversion, benchmarks, both validation comparisons, demo) and the user wants to optimize further (case B).
 
-- The cloned source repo contains hand-written CUDA / `__global__` / `cudaLaunchKernel` code that implements a **fused operation** (i.e. it does the work of multiple framework-level ops in a single kernel). Plain CUDA-via-PyTorch (e.g. `torch.bmm`) does **not** count -- that is already covered by stock OV ops. What counts is custom `.cu` / `.cuh` files in the repo, or `torch.utils.cpp_extension` / `setup.py` building a CUDA extension that the model's forward path calls into.
-- Sections 1-6 all passed: conversion succeeded (Path A and/or Path B), benchmarks ran, both validation comparisons (A: FP16 vs FP16, B: FP16 vs FP32) passed against their thresholds, and the demo runs.
+If neither applies, skip Stage 8 and note in the conversion report what you saw and why you didn't run it. Stage 8 also **delegates** to two other skills -- `vtune-profiler-skill` (per-kernel GPU timing of the current subgraph; case B only) and `ov-custom-pipeline` (the actual custom-op authoring, required either way). If `ov-custom-pipeline` is missing, stop and tell the user which to install rather than freelancing a kernel.
 
-If either condition is missing, skip this section entirely. Mention in the conversion report what you saw and why you did not run Stage 8 -- the user may want to revisit it later.
-
-### 7.2 Required dependent skills -- check first, hard stop if missing
-
-This stage **delegates** to two other skills. Before doing any work in Stage 8:
-
-1. Check that **`vtune-profiler-skill`** is available (used for per-kernel GPU timing of the fused subgraph as it currently runs in OV).
-2. Check that **`ov-custom-pipeline`** is available (used for the actual custom-op authoring -- it covers single-graph fusion, multi-model OCL orchestration, and SYCL interop, and decides which approach fits the kernel).
-
-If either skill is missing, **stop immediately**. Do not attempt to write a custom op from scratch without the dependent skill -- the result will diverge from the user's other custom-op work and bypass the validated patterns those skills exist to encode. Tell the user exactly which skill is missing, point them at `skill-creator` to install or build it, and wait. Example wording:
-
-> Stage 8 (CUDA -> OV custom-op migration) needs the `ov-custom-pipeline` skill, which is not currently installed. Please install it (or create it via `skill-creator`) before I continue. I have not started any custom-op work yet -- the baseline conversion in Sections 1-6 is complete and unaffected.
-
-Do not work around the absence by reading documentation and freelancing the kernel. The whole point of the skill dependency is consistency.
-
-### 7.3 Profiling: is the OV-GPU subgraph actually slow enough to be worth porting?
-
-Before proposing the optimization, *measure*. A custom op that saves 50 microseconds out of a 30 ms inference is not worth the maintenance cost. Use `vtune-profiler-skill` to get per-kernel timing of the current OV-GPU run.
-
-Steps:
-
-1. **Identify the target subgraph.** Read the CUDA kernel's source to understand what op sequence it fuses (e.g. "this kernel does scatter -> elementwise mul -> reduce-sum"). Map that to the corresponding region in the OV IR by walking `model.get_ops()` and locating the matching node names.
-2. **Run a `gpu-hotspots` analysis on the baseline OV IR** under `benchmark_app -hint latency -infer_precision f16 -d GPU`, following the procedure in `vtune-profiler-skill`. Per-kernel rows -- never averaged.
-3. **Sum the kernel-level cost of the target subgraph.** That is your optimization budget: the maximum time a custom op could save if it were free. The actual saving will be less.
-4. **Compute the budget as a fraction of total inference latency.** If the fused-equivalent subgraph is < 5% of total wall-clock, the upper bound on improvement is small -- usually not worth a custom op. If it's > 15%, a custom op is likely worth proposing. The 5-15% middle band depends on how mature/tricky the kernel is; lean toward "skip" for one-off models and "do it" for models the user expects to deploy widely.
-
-Save the profiling output under `validation/optimize_v2_feasibility/` (next to the baseline validation, so the user can see the analysis even if they decline to proceed):
-
-```
-validation/
-  optimize_v2_feasibility/
-    vtune_gpu_hotspots/        # raw VTune result directory or its export
-    target_subgraph_kernels.md # which kernel rows correspond to the CUDA-fused region, summed cost
-    feasibility_report.md      # budget % of total latency, recommendation, and a yes/no proposal
-```
-
-### 7.4 Decision gate -- ask the user before any code is written
-
-After profiling, write a short feasibility report and **stop to ask the user**. Do not start writing a custom op proactively. The report and question should look roughly like this:
-
-> Stage 8 feasibility check:
-> - The source repo's `<kernel_name>.cu` fuses ops X, Y, Z into one CUDA launch.
-> - In the current OV-GPU IR, that subgraph is implemented as N stock ops, taking T ms / inference (P% of total latency T_total).
-> - VTune shows the dominant cost is `<dominant kernel>` at K ms (occupancy O%, cache-hit C%, ...).
-> - My recommendation: <port / skip / borderline>, because <one-sentence reason>.
->
-> Do you want me to proceed with writing an OpenVINO custom op for this? If yes, I will use `ov-custom-pipeline` to choose between single-graph fusion / multi-model OCL / SYCL interop, build under `export_<model_name>/optimize_v2/`, and re-run Sections 2-5 (convert / benchmark / validate / demo) on the optimized version.
-
-If the user declines (or says "later"), stop here. Save the feasibility report and move on. **Do not** start the optimization to "save time" -- the user's agreement is a hard gate.
-
-If the user agrees, proceed to 7.5.
-
-### 7.5 Building `optimize_v2/`
-
-Delegate the custom-op authoring entirely to `ov-custom-pipeline`. Its job is to pick between the three fusion strategies and produce the kernel + integration. This skill's job at this stage is the **harness around it**: directory layout, re-running Sections 2-5 with the new IR as input, and producing a comparison report.
-
-Directory layout under the existing export directory (do not create a new `export_<model_name>_v2/` -- this is the same model, just an alternative IR for the same source):
-
-```
-export_<model_name>/
-  ... (everything from Sections 1-6 unchanged, untouched) ...
-  optimize_v2/
-    custom_op/                       # populated by ov-custom-pipeline
-      <kernel_source_files>          # .cl / .cpp / .sycl per the chosen approach
-      build/                         # compiled artifacts
-      build.md                       # build instructions, copied/adapted from ov-custom-pipeline
-    converter/
-      convert_v2.py                  # builds the optimized IR, invoking the custom op
-      <model>_v2.xml                 # optimized OpenVINO IR
-      <model>_v2.bin
-    benchmark/
-      benchmark_cpu_v2_result.txt    # only if the custom op runs on CPU; otherwise note "GPU-only" in v2_summary.md
-      benchmark_gpu_v2_result.txt
-      v2_vs_baseline.md              # latency table + op-graph diff vs the baseline IR, plus the same VTune
-                                     # gpu-hotspots run on v2 so per-kernel cost can be diffed against 7.3
-    validation/
-      validate_v2.py                 # SAME validation harness as Section 4, with v2 IR as the new "OV-GPU-FP16" side
-      validation_results_v2.json
-      validation_report_v2.md        # both A and B comparisons, same diagnosis table
-    demo/
-      infer_demo_v2.py               # demo using v2 IR (can be a thin wrapper around the original)
-    optimize_v2_report.md            # narrative: what was fused, which ov-custom-pipeline approach, measured speedup,
-                                     # validation status, and an honest "was this worth it?" summary
-```
-
-Re-running rules:
-
-1. **Re-run Section 2 against the v2 IR only when it is meaningfully different from baseline.** Do not regenerate `<model>_simplified.xml` etc. -- those are stable.
-2. **Re-run Section 3 (benchmark) on v2.** Save logs under `optimize_v2/benchmark/`. Compare against the original `benchmark/benchmark_gpu_result.txt` in `v2_vs_baseline.md`.
-3. **Re-run Section 4 (validation, BOTH comparisons) on v2.** This is non-negotiable. A custom op is exactly the kind of change that can pass A (FP16 vs FP16) by chance on one input and explode on another. Use the same diverse input set as the baseline. Apply the same A-tight / B-loose threshold tiers. The reference for A becomes "the baseline OV IR at FP16" rather than the source framework -- you are now answering "did v2 stay equivalent to v1?" -- which is the right question for an optimization, per Section 4's note on optimized pipelines.
-4. **Re-run Section 5 (demo)** on at least the real sample input, and visually confirm output matches baseline.
-
-If validation on v2 fails (A fails -> custom op has a bug; B fails -> custom op introduced extra precision loss beyond stock FP16), do **not** silently fall back to baseline. Report the failure, keep v2 artifacts so the user can see what went wrong, and recommend either fixing the kernel via `ov-custom-pipeline` or abandoning the optimization. The user's trust depends on us being honest about when an optimization didn't pan out.
-
-### 7.6 Final report
-
-Append a section to the main conversion report (or write `optimize_v2_report.md` and link it) covering:
-
-- Which CUDA kernel(s) were targeted, with file paths in the source repo
-- VTune-measured baseline cost (Section 7.3 numbers)
-- Which `ov-custom-pipeline` approach was chosen and why
-- v2 vs baseline: latency delta, op count delta, validation status (A and B both)
-- Honest verdict: keep v2 as the recommended deployment IR, or keep baseline because v2 didn't beat it by enough / didn't validate / introduced too much precision loss
-
-The verdict matters more than the speedup number. A 30% speedup that fails B is not a win; a 5% speedup that passes both and simplifies the graph might be.
+When both conditions hold and the user is interested, follow the full procedure in **`references/cuda-fused-op-migration.md`**: profile the subgraph to decide if it's worth porting, stop at a decision gate to get the user's explicit agreement, then build `optimize_v2/` and re-run Sections 2-5 (convert / benchmark / validate / demo) against the optimized IR with an honest keep-v2-or-keep-baseline verdict. Do not start any custom-op code before reading that file and clearing its decision gate.
 
 ---
 
@@ -548,14 +438,13 @@ The verdict matters more than the speedup number. A 30% speedup that fails B is 
 
 ### Scripts (`scripts/`)
 
-- **`example_convert.py`** -- Template conversion script with configurable parameters (input model, output dir, shape, precision, etc.). Use as a starting point when writing `converter/convert.py` for each model.
-- **`parse_benchmark.py`** -- Parses `benchmark_app` log files and extracts key metrics (OpenVINO version, latency, throughput, device info). Use this to generate structured benchmark summaries from raw logs.
 - **`fetch_assets_template.py`** -- Template for the per-export `scripts/fetch_assets.py`. Implements the manifest + SHA256 verify + skip-if-present pattern described in Section 6 "GitHub-ready cleanup". Copy it into each export directory and fill in the manifest for that model's weights and large test inputs.
 
 ### References (`references/`)
 
 - **`hf-mirror-guide.md`** -- How to configure HuggingFace mirror (hf-mirror.com) for downloading models and datasets in China. Read this whenever the model or weights are hosted on HuggingFace.
 - **`per-layer-profiling.md`** -- How to get per-layer timing out of a converted IR using `benchmark_app -exec_graph_path` (or `-pc`), what each layer's attributes mean, and how to read the results. Read this when the user wants to optimize and needs to know which layers dominate inference time (see Section 3 and the closing question in Section 6).
+- **`cuda-fused-op-migration.md`** -- The full Stage 8 procedure for porting a hand-written CUDA fused kernel to an OpenVINO custom op, covering both the conversion-blocking case (case A, higher priority) and the pure optimization case (case B, opt-in): trigger conditions, dependent-skill checks, subgraph scoping, the user decision gate, `optimize_v2/` layout, and validation. Read this only when Section 7's trigger conditions hold for either case.
 
 ## Platform Notes
 
@@ -570,68 +459,31 @@ Before delivering results to the user, verify every item. This catches common om
 
 ### Files
 
-- [ ] `export_<model_name>/` directory exists with correct structure
-- [ ] `<model_name>/` contains the cloned model source code
-- [ ] **Path A attempted first** (`convert_direct.py` using `ov.convert_model()`) -- success or failure documented in the conversion report
-- [ ] If Path A succeeded: `converter/convert_direct.py` exists and is runnable, and `converter/<model>_direct.xml` + `.bin` exist and are non-empty
-- [ ] `converter/convert.py` (ONNX-path) exists and is runnable end-to-end
-- [ ] `converter/<model_name>_simplified.xml` and `.bin` exist and are non-empty
-- [ ] `benchmark/benchmark_cpu_result.txt` exists, produced by `benchmark_app -m <model> -d CPU -hint latency -infer_precision f16`
-- [ ] `benchmark/benchmark_gpu_result.txt` exists, produced by `benchmark_app -m <model> -d GPU -hint latency -infer_precision f16`
-- [ ] If Path A succeeded: `benchmark/benchmark_cpu_direct_result.txt` and `benchmark/benchmark_gpu_direct_result.txt` also exist
-- [ ] If Path A succeeded: `benchmark/comparison_onnx_vs_direct.md` exists with latency table, op-graph counter diff, file-size diff, and a recommendation
-- [ ] `benchmark/benchmark_app_usage.md` exists with the exact commands above and parameter explanations
-- [ ] `validation/validate.py` exists and runs **both** comparisons in one process: A (OV-GPU-FP16 vs Source-CPU-FP16, tight) and B (OV-GPU-FP16 vs Source-CPU-FP32, loose)
-- [ ] `validation/validation_results.json` contains per-input metrics under separate keys for A and B
-- [ ] `validation/validation_report.md` reports both comparisons, applies the tight/loose threshold tiers correctly, and includes an explicit attribution sentence (conversion bug vs FP16 precision degradation) drawn from the diagnosis table
-- [ ] Validation uses diverse inputs (1 real + N >= 10 synthetic across multiple distributions), not a single image
-- [ ] Both reference precisions are spelled out in the report: same-precision FP16 baseline AND FP32 baseline. For optimization workflows, the FP16 baseline becomes the previously-validated OV IR.
-- [ ] No `.npy` files persisted under `validation/` -- comparison is done in-process
-- [ ] `demo/infer_demo.py` exists and runs successfully
-- [ ] `demo/` contains sample input data (real image/data or generated tensors)
-- [ ] `demo/` contains pre-generated sample output for user comparison
-- [ ] `README.md` exists at `export_<model_name>/` root
-
-### README content
-
-- [ ] Environment and dependency installation instructions
-- [ ] Complete from-scratch conversion steps referencing `converter/convert.py`
-- [ ] Benchmark commands and how to interpret results
-- [ ] Validation instructions referencing `validation/validate.py` and results
-- [ ] Demo usage with custom data replacement instructions
-- [ ] File listing matches actual directory contents
-
-### Data integrity
-
-- [ ] All performance numbers in README trace back to `benchmark_app` log files
-- [ ] Provenance documented: model source URL + commit, weight source + size, test data source
-- [ ] No hardcoded absolute paths in `convert.py`, `infer_demo.py`, or `README.md` (use relative paths within the export directory for portability)
+- [ ] `export_<model_name>/` exists with correct structure; `<model_name>/` contains the cloned source code
+- [ ] Path A attempted first, success/failure documented. If it succeeded: `convert_direct.py` and `<model>_direct.xml`/`.bin` exist, runnable, non-empty, and Path B was not run (unless the user explicitly asked for both)
+- [ ] If Path A failed (or wasn't applicable): `convert.py` (ONNX path) runs end-to-end; `<model>_simplified.xml`/`.bin` exist and are non-empty
+- [ ] `benchmark/benchmark_gpu_result.txt` exists (from `benchmark_app -d GPU -hint latency -infer_precision f16`), for whichever IR was actually produced; `benchmark_app_usage.md` documents the command and how to read it
+- [ ] Only if the user explicitly asked for both routes: `benchmark_gpu_direct_result.txt` and `comparison_onnx_vs_direct.md` (latency table, op-graph counter diff, file-size diff, recommendation) exist
+- [ ] `validation/validate.py` runs both A (OV-GPU-FP16 vs Source-CPU-FP16, tight) and B (OV-GPU-FP16 vs Source-CPU-FP32, loose) in one process, on diverse inputs (1 real + N >= 10 synthetic), with no `.npy` dumps
+- [ ] `validation_results.json` and `validation_report.md` report both comparisons against their own threshold tier, with an explicit attribution sentence (conversion bug vs FP16 precision degradation)
+- [ ] `demo/infer_demo.py` runs successfully; `demo/` has sample input and pre-generated sample output
+- [ ] `README.md` exists at the export root, and its file listing matches actual directory contents
 
 ### GitHub readiness (run as the final step)
 
-- [ ] `export_<model_name>/.gitignore` exists, covering `.bin`, `.onnx`, pretrained-weight extensions used by this model, and `optimize_v2/custom_op/build/` if Stage 8 ran
-- [ ] `scripts/fetch_assets.py` exists, with an explicit manifest (URL, dest path, SHA256, size, description) for every derived large file the user will need
-- [ ] Running `fetch_assets.py` on a clean clone successfully restores every file the `.gitignore` excludes
-- [ ] Pre-push size audit returned zero hits: no tracked file exceeds 95 MB (e.g. `git ls-files -z | xargs -0 stat -c "%s %n" | awk '$1>95000000'`)
-- [ ] No Git LFS, no GitHub Releases, no chunk-splitting -- derived files are reproduced from source, not stored externally
-- [ ] README includes both a "What's in this repo and what isn't" note AND `fetch_assets.py` as step 2 of the reproduce-from-scratch flow
+- [ ] `.gitignore` covers `.bin`, `.onnx`, this model's weight extensions, and `optimize_v2/custom_op/build/` if Stage 8 ran; `scripts/fetch_assets.py` has a full manifest (URL, dest path, SHA256, size) for every derived large file
+- [ ] Clean-clone check: running `fetch_assets.py` restores every file `.gitignore` excludes
+- [ ] Pre-push size audit returns zero hits (no tracked file > 95 MB); no Git LFS, GitHub Releases, or chunk-splitting
+- [ ] README has a "what's in this repo and what isn't" note, with `fetch_assets.py` as step 2 of the reproduce-from-scratch flow
 
-### Conversion report
+### Conversion report & data integrity
 
-- [ ] Success: detailed step-by-step report with commands and outputs
-- [ ] Report names which path(s) were attempted and whether each succeeded or failed, with the reason
-- [ ] When both paths succeed, the report links to `benchmark/comparison_onnx_vs_direct.md` and states the chosen default IR
-- [ ] Failure: `<model>_OpenVINO_conversion_failure_analysis.md` with all attempts, errors, and root cause
-- [ ] On success, the user was asked whether they want to pursue optimization, with a recommendation to start with a per-layer IR profile (`references/per-layer-profiling.md`) if so
+- [ ] Success: step-by-step report with commands/outputs. Failure: `<model>_OpenVINO_conversion_failure_analysis.md` with every attempt, error, and root cause
+- [ ] Report names which path(s) succeeded; when both did, links `comparison_onnx_vs_direct.md` and states the chosen default IR
+- [ ] All performance numbers trace back to `benchmark_app` logs; provenance documented (model source + commit, weight source + size, test data source); no hardcoded absolute paths in scripts or README
+- [ ] User was asked whether to pursue optimization, with a per-layer profile (`references/per-layer-profiling.md`) recommended as the starting point
 
 ### Stage 8 (only if triggered -- see Section 7)
 
-- [ ] Trigger conditions verified: source repo contains a hand-written CUDA kernel implementing a fused op AND Sections 1-6 all passed cleanly
-- [ ] Both dependent skills (`vtune-profiler-skill` and `ov-custom-pipeline`) confirmed installed BEFORE any Stage 8 work; if either was missing, work was halted and the user was told which skill to install
-- [ ] `validation/optimize_v2_feasibility/` exists with VTune `gpu-hotspots` output, target subgraph kernel summary, and a feasibility report stating the target subgraph's % of total latency
-- [ ] User was explicitly asked whether to proceed -- and agreed -- before any custom-op code was written
-- [ ] `optimize_v2/custom_op/` was authored via `ov-custom-pipeline` (not freelanced), with build instructions
-- [ ] `optimize_v2/converter/convert_v2.py` produces `<model>_v2.xml` + `.bin`
-- [ ] `optimize_v2/benchmark/benchmark_gpu_v2_result.txt` exists and `v2_vs_baseline.md` includes both a latency table and a per-kernel VTune diff against Section 7.3
-- [ ] `optimize_v2/validation/validate_v2.py` re-runs **both** A and B comparisons, with the baseline OV IR as the FP16 reference; `validation_report_v2.md` applies the same A-tight / B-loose tiers and includes an explicit attribution sentence
-- [ ] `optimize_v2/optimize_v2_report.md` ends with an honest verdict (keep v2 / keep baseline) -- not just a speedup number
+- [ ] Trigger conditions and dependent skills confirmed before any Stage 8 work started
+- [ ] All items in `references/cuda-fused-op-migration.md`'s own checklist verified before delivering `optimize_v2/`

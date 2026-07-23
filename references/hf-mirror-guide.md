@@ -27,22 +27,22 @@ Add the export line to `~/.bashrc` for persistence.
 
 This works with `transformers`, `diffusers`, `huggingface_hub`, and any library that calls HuggingFace download APIs internally.
 
-## Method 2: huggingface-cli
+## Method 2: hf CLI
 
-The official HuggingFace CLI tool with built-in download management (resume, retry, etc.).
+The official HuggingFace CLI with built-in download management (resumable, retry, parallel workers). In recent `huggingface_hub` releases the command is `hf`; the older `huggingface-cli` entry point still works as a deprecated alias, but prefer `hf`.
 
 1. Install: `pip install -U huggingface_hub`
 2. Set mirror: `$env:HF_ENDPOINT = "https://hf-mirror.com"` (PowerShell) or `export HF_ENDPOINT=https://hf-mirror.com` (Linux)
 3. Download model:
    ```
-   huggingface-cli download --resume-download <org>/<model> --local-dir <model>
+   hf download <org>/<model> --local-dir <model>
    ```
 4. Download dataset:
    ```
-   huggingface-cli download --repo-type dataset --resume-download <dataset> --local-dir <dataset>
+   hf download <dataset> --repo-type dataset --local-dir <dataset>
    ```
 
-Add `--local-dir-use-symlinks False` to disable symlinks (get plain files directly).
+Downloads are resumable by default, so no separate resume flag is needed. `--local-dir` writes plain files (no symlinks) directly into the target folder.
 
 ## Method 3: hfd (HuggingFace Downloader)
 
@@ -67,9 +67,9 @@ Some models (e.g., Llama, Gemma) require accepting a license on HuggingFace firs
 2. Get an Access Token from https://huggingface.co/settings/tokens
 3. Use the token with your download tool:
 
-   **huggingface-cli:**
+   **hf CLI:**
    ```
-   huggingface-cli download --token hf_*** --resume-download <org>/<model> --local-dir <model>
+   hf download <org>/<model> --token hf_*** --local-dir <model>
    ```
 
    **hfd:**

@@ -22,9 +22,9 @@ flag.
 | `-exec_graph_path <file>.xml` | Serializes the full post-compilation runtime graph to XML, one node per compiled layer, with `execTimeMcs`, `primitiveType` (chosen kernel/impl), `outputLayouts`, `outputPrecisions`, `originalLayersNames` | Need to parse, diff, or archive the per-layer breakdown |
 
 **Do not pass both together.** Per-layer timing is automatically
-enabled by `-exec_graph_path`; adding `-pc` on top inflates wall-clock
-latency by ~30 ms of extra instrumentation with no additional signal.
-Pick one based on whether you need structured output.
+enabled by `-exec_graph_path`; adding `-pc` on top only piles on extra
+instrumentation overhead with no additional signal. Pick one based on
+whether you need structured output.
 
 ## Recommended command
 
@@ -114,9 +114,11 @@ the same per-layer attributes and is read the same way as the
    (`Convolution`, `MatMul`, `Reorder`, `Concat`, ...) with
    `collections.Counter`-style aggregation to see which *op family*
    dominates, not just which single node.
-4. Note `primitiveType` for the hottest layers -- if a heavy op landed
-   on a `_ref` (reference/fallback) kernel instead of an optimized one,
-   that is itself an actionable finding worth calling out.
+4. Note `primitiveType` for the hottest layers -- it records which
+   kernel implementation the GPU plugin selected for each op. This is
+   useful context when correlating a layer's cost with its shape,
+   layout, and precision; report it alongside the timing rather than
+   reading any single kernel name as good or bad on its own.
 
 ## Pitfalls
 
@@ -125,11 +127,11 @@ the same per-layer attributes and is read the same way as the
    ensures the capture happens after warm-up, not during first-call
    JIT/shader compilation.
 2. **Don't compare `-pc` and `-exec_graph_path` runs to each other for
-   absolute timing** -- both add instrumentation overhead (~5-10%
-   inflation per layer, ~30 ms wall-clock), so relative (A vs. B, e.g.
-   before/after an optimization) comparisons are valid but absolute
-   numbers should be cross-checked against the uninstrumented benchmark
-   log.
+   absolute timing** -- both add some instrumentation overhead, so
+   relative (A vs. B, e.g. before/after an optimization) comparisons
+   are valid but absolute numbers should be cross-checked against the
+   uninstrumented benchmark log. Measure the overhead on your own model
+   if you need a concrete figure; it varies with graph size and device.
 3. **`exec_graph.bin` is not real weights** -- do not attempt to load
    it as a standalone model.
 4. **Thermal/cache state** -- compare two exec_graph captures collected
@@ -147,7 +149,7 @@ tooling, and Capability 2 covers GPU kernel-level occupancy/cache/
 bandwidth that `exec_graph` cannot show):
 
 - A structured diff between two exec_graph exports (`compare`
-  subcommand, top-N Δ by layer, aggregate Δ by op type)
+  subcommand, top-N delta by layer, aggregate delta by op type)
 - Per-GPU-kernel occupancy, cache hit-rate, or memory bandwidth
   (`gpu-hotspots` characterization -- a different, lower-level
   granularity than exec_graph)

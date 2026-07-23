@@ -25,8 +25,8 @@ Once installed, Claude Code auto-invokes this skill for model conversion tasks:
 ## Workflow
 
 1. **Acquire** - Clone repo + download weights
-2. **Convert** - Export to ONNX (optional) → OpenVINO IR
-3. **Benchmark** - Run `benchmark_app` on CPU and GPU
+2. **Convert** - Export to ONNX (optional) -> OpenVINO IR
+3. **Benchmark** - Run `benchmark_app` on GPU
 4. **Validate** - Compare OpenVINO IR (GPU) vs original (CPU) outputs
 5. **Demo** - Create inference demo with real data
 6. **Document** - Generate reports and README
@@ -36,12 +36,12 @@ Once installed, Claude Code auto-invokes this skill for model conversion tasks:
 
 ```
 export_<model_name>/
-├── <model_name>/           # Source code
-├── converter/              # IR files (.xml, .bin) and convert script
-├── benchmark/              # CPU/GPU benchmark results
-├── validation/             # Numerical validation reports
-├── demo/                   # Inference demo + test data
-└── README.md
+  <model_name>/           # Source code
+  converter/              # IR files (.xml, .bin) and convert script
+  benchmark/              # GPU benchmark results
+  validation/             # Numerical validation reports
+  demo/                   # Inference demo + test data
+  README.md
 ```
 
 ## Features
