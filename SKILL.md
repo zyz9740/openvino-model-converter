@@ -82,12 +82,35 @@ OpenVINO supports two well-established routes to an IR model, and both are first
 
 Always default to FP16 precision for a good balance of model size and accuracy.
 
+### When conversion fails or misbehaves
+
+Both paths can fail outright, or "succeed" while producing something broken
+(NaN output, wrong output shape, compiles on CPU but not GPU). Before
+concluding a model can't be converted, or reaching for Stage 8 (Section 7),
+work through **`references/common-conversion-blockers.md`** -- it catalogs
+the recurring failure categories seen across real conversions (structured
+dict/list outputs that don't trace, a CUDA-only implementation blocking
+export whether it's a compiled C++ extension or an optional fast-path
+dependency like xformers, stale APIs in unmaintained repos, an unsupported
+op needing an equivalent substitution, FP16 overflow from a too-small
+clamp/epsilon, GPU-plugin compile failures on high-rank reshapes, dynamo
+exporter bugs) and, for each, the lightest fix that resolves it.
+
+The core principle: **prefer an external wrapper, a runtime monkeypatch
+scoped to the converter script, or an exporter/environment flag over
+editing the cloned model source.** Only fall through to an actual patch
+file against the vendored repo when the blocker lives inside the source
+itself with no way to route around it from outside (e.g. an import that
+fails before any wrapper code can run). The reference file's "fix-order
+ladder" spells out this precedence and when each rung applies.
+
 ### Key considerations
 
 - If Path A doesn't succeed and you fall through to Path B, keep the shared model-build/patch module in `converter/` reusable so `convert_direct.py` (if you keep the failed attempt around for the report) and `convert.py` (ONNX path) don't duplicate patching logic. Duplicating it across two scripts is a maintenance hazard.
 - Check the model repo for existing export examples or scripts (ONNX or OpenVINO) -- reuse them rather than writing from scratch, because model authors know their own edge cases best
 - Handle dynamic shapes carefully -- some models need explicit static shape setting for OpenVINO compatibility
 - If a specific model doesn't convert cleanly through Path A, run it through Path B before concluding it can't be converted. Document every attempt in the report.
+- If a source patch against the cloned/submodule repo turns out to be necessary, follow `references/common-conversion-blockers.md`'s "Formal patch policy" for where to store it, how to scope it, and what the conversion report must say about it.
 
 ## 3. Performance Benchmarking
 
@@ -444,6 +467,7 @@ When both conditions hold and the user is interested, follow the full procedure 
 
 - **`hf-mirror-guide.md`** -- How to configure HuggingFace mirror (hf-mirror.com) for downloading models and datasets in China. Read this whenever the model or weights are hosted on HuggingFace.
 - **`per-layer-profiling.md`** -- How to get per-layer timing out of a converted IR using `benchmark_app -exec_graph_path` (or `-pc`), what each layer's attributes mean, and how to read the results. Read this when the user wants to optimize and needs to know which layers dominate inference time (see Section 3 and the closing question in Section 6).
+- **`common-conversion-blockers.md`** -- Catalog of recurring conversion failure categories (structured dict/list outputs, CUDA-only implementations with a switchable fallback -- compiled C++ extensions and optional fast-path deps like xformers alike, stale APIs in unmaintained repos, unsupported-op substitution, FP16 overflow from clamp/epsilon underflow, GPU-plugin compile failures on high-rank reshapes, dynamo exporter bugs) and the fix-order ladder (wrapper -> monkeypatch -> exporter/env flag -> import trick -> formal source patch) for resolving each. Read this whenever Path A/B fails or produces broken output, before concluding a model can't be converted.
 - **`cuda-fused-op-migration.md`** -- The full Stage 8 procedure for porting a hand-written CUDA fused kernel to an OpenVINO custom op, covering both the conversion-blocking case (case A, higher priority) and the pure optimization case (case B, opt-in): trigger conditions, dependent-skill checks, subgraph scoping, the user decision gate, `optimize_v2/` layout, and validation. Read this only when Section 7's trigger conditions hold for either case.
 
 ## Platform Notes
