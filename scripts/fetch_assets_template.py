@@ -13,6 +13,27 @@ Design rules (do not relax without reading SKILL.md Section 6 first):
 - Each asset's dest_path is its EXACT final relative location under the
   export directory, so the user does not have to mv anything afterwards.
 - Re-running with everything already present is a no-op (skip on hash match).
+
+LAN cache (see the `seaweedfs-lan-storage` skill): this script does NOT
+compute cache paths or talk to the Filer itself -- that logic belongs
+entirely to that skill so it stays a single implementation. Instead:
+1. Before filling in ASSETS, invoke `seaweedfs-lan-storage` to derive the
+   cache path for each weight's origin URL (its source-addressed rule,
+   `shared-cache/<host>/<path>`) and check whether it's already there.
+2. If it's cached, put the cache's full download URL as the FIRST entry
+   in that asset's `alternate_urls` (or as `url` itself) -- it's just
+   another HTTP source to this script, tried in order like any mirror.
+3. If it's not cached, leave the public source as `url`, run this script
+   once to download for real, then invoke `seaweedfs-lan-storage` to
+   upload the downloaded file to its derived cache path so the next
+   conversion (this machine or any other) hits the cache.
+
+Step 2/3 is not optional: whenever a cache path is resolved (hit) or
+newly populated (miss), come back and add it to `alternate_urls` below
+BEFORE moving on, and mention it in the README's asset list too. A cache
+path that only exists in shell history is as good as not having one --
+the whole point of a deterministic path is that it's written down
+somewhere the next run (or the next person) will actually see it.
 """
 
 from __future__ import annotations
@@ -33,15 +54,17 @@ class Asset:
     sha256: str             # lowercase hex
     size_bytes: int
     description: str
-    alternate_urls: tuple[str, ...] = ()  # fallback mirrors
+    alternate_urls: tuple[str, ...] = ()  # fallback mirrors; put the LAN cache URL first if known
 
 
 # Fill this in for each export. Examples shown -- delete and replace.
 ASSETS: list[Asset] = [
-    # Example: pretrained weights from HuggingFace via mirror
+    # Example: pretrained weights from HuggingFace, with the LAN cache tried first
     # Asset(
     #     url="https://hf-mirror.com/<owner>/<model>/resolve/main/pytorch_model.bin",
-    #     alternate_urls=("https://huggingface.co/<owner>/<model>/resolve/main/pytorch_model.bin",),
+    #     alternate_urls=(
+    #         "https://huggingface.co/<owner>/<model>/resolve/main/pytorch_model.bin",
+    #     ),
     #     dest_path="<model_name>/checkpoints/pytorch_model.bin",
     #     sha256="0000000000000000000000000000000000000000000000000000000000000000",
     #     size_bytes=512_000_000,
